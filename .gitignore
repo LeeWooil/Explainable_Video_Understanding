@@ -10,3 +10,4 @@ CLAUDE.md
 .codex
 *.txt
 dataset/
+scripts/slack_notify.sh
