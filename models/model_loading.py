@@ -33,7 +33,7 @@ def _load_state_dict(model, state_dict, prefix: str = "", ignore_missing: str = 
             if child is not None:
                 load(child, module_prefix + name + ".")
 
-    load(model, prefix=prefix)
+    load(model, module_prefix=prefix)
 
     warned_missing = []
     ignored_missing = []

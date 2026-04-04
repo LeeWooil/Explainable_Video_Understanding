@@ -2,6 +2,11 @@ runs/
 output/
 cache/
 log/*.out
+log/*.err
 __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
+CLAUDE.md
+.codex
+*.txt
+dataset/
