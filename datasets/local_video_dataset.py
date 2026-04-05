@@ -60,6 +60,7 @@ class LocalVideoDataset(Dataset):
         num_frames: int = 16,
         sampling_rate: int = 4,
         input_size: int = 224,
+        short_side_size: int = 224,
         deterministic: bool = True,
         view_mode: str = "random",
     ) -> None:
@@ -69,6 +70,7 @@ class LocalVideoDataset(Dataset):
         self.num_frames = int(num_frames)
         self.sampling_rate = int(sampling_rate)
         self.input_size = int(input_size)
+        self.short_side_size = int(short_side_size)
         self.deterministic = bool(deterministic)
         self.view_mode = str(view_mode)
 
@@ -97,7 +99,12 @@ class LocalVideoDataset(Dataset):
         if total_frames <= 0:
             raise RuntimeError(f"Empty video: {sample_path}")
 
-        if self.data_set.lower() in {"ssv2", "ssv2_5k", "ssv2_chiral", "haa100", "penn", "single_object"}:
+        # Segment-based sampling (SSV2-style): used for SSV2, KTH, and similar datasets
+        _segment_datasets = {
+            "ssv2", "ssv2_5k", "ssv2_chiral", "haa100", "penn", "single_object",
+            "kth", "kth-5", "kth-2", "penn-action",
+        }
+        if self.data_set.lower() in _segment_datasets:
             average_duration = total_frames // self.num_frames
             if average_duration > 0:
                 if self.view_mode == "center_uniform" or self.deterministic:
@@ -143,18 +150,36 @@ class LocalVideoDataset(Dataset):
             frame_list = self.aug_transform(frame_list)
         frame_tensors = [self.rgb_transform(frame) for frame in frame_list]
         video = torch.stack(frame_tensors, dim=0)  # T,C,H,W
-        video = video.permute(0, 2, 3, 1)  # T,H,W,C
-        video = _tensor_normalize(video, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-        video = video.permute(3, 0, 1, 2)  # C,T,H,W
 
         if self.view_mode == "center_uniform" or self.deterministic:
-            crop_h = crop_w = min(video.shape[2], video.shape[3])
-            top = max((video.shape[2] - crop_h) // 2, 0)
-            left = max((video.shape[3] - crop_w) // 2, 0)
+            # PCBEAR-compatible: Resize short side -> CenterCrop -> Normalize
+            _, _, h, w = video.shape
+            if h < w:
+                new_h = self.short_side_size
+                new_w = int(w * new_h / h)
+            else:
+                new_w = self.short_side_size
+                new_h = int(h * new_w / w)
+            video = torch.nn.functional.interpolate(
+                video, size=(new_h, new_w), mode="bilinear", align_corners=False
+            )
+            # CenterCrop to input_size
+            crop_h = crop_w = self.input_size
+            top = max((new_h - crop_h) // 2, 0)
+            left = max((new_w - crop_w) // 2, 0)
             crop_params = (top, left, crop_h, crop_w)
+            video = video[:, :, top : top + crop_h, left : left + crop_w]
+            # Normalize
+            video = video.permute(0, 2, 3, 1)  # T,H,W,C
+            video = _tensor_normalize(video, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+            video = video.permute(3, 0, 1, 2)  # C,T,H,W
         else:
+            # Training augmentation: Normalize -> RandomCrop -> Resize
+            video = video.permute(0, 2, 3, 1)  # T,H,W,C
+            video = _tensor_normalize(video, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+            video = video.permute(3, 0, 1, 2)  # C,T,H,W
             crop_params = self._sample_spatial_params(video.shape[2], video.shape[3])
-        video = _apply_crop_and_resize(video, crop_params, self.input_size)
+            video = _apply_crop_and_resize(video, crop_params, self.input_size)
         return video, {"crop_params": crop_params}
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, int, dict[str, Any]]:

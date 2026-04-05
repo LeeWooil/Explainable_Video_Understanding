@@ -1,9 +1,11 @@
-"""Train a global CBM using concept-aware spatial pooling.
+"""Train a global CBM using concatenated backbone + localizer features.
 
 Pipeline:
   Video -> FrozenLocalizer -> (concept_logits [B,C,T,H,W], feature_map [B,D,T,H,W])
-       -> ConceptAwareSpatialPool -> [B, D]  (concept-guided global feature)
-       -> W_c Linear(D, C) -> [B, C]  (concept scores, supervised by global labels)
+       -> mean_pool(feature_map) + fc_norm -> [B, D]
+       -> max_pool(concept_logits)          -> [B, C]
+       -> concat -> [B, D+C]
+       -> W_c Linear(D+C, C) -> [B, C]  (concept scores, supervised by global labels)
        -> W_g (GLM-SAGA sparse classifier) -> [B, num_classes]
 """
 from __future__ import annotations
@@ -24,7 +26,6 @@ from tqdm.auto import tqdm
 
 from configs.defaults import build_videomae_args
 from datasets.local_video_dataset import LocalVideoDataset, _build_sample_id
-from models.attention_pool import ConceptAwareSpatialPool
 from models.backbone import FrozenVideoMAEBackbone
 from models.localizer import VideoMAELocalizer
 
@@ -35,7 +36,7 @@ from models.localizer import VideoMAELocalizer
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        "Train a global CBM with concept-aware spatial pooling."
+        "Train a global CBM with concatenated backbone + localizer features."
     )
     # data
     parser.add_argument("--anno-path", type=Path, required=True)
@@ -75,8 +76,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--proj-steps", type=int, default=3000)
     parser.add_argument("--proj-batch-size", type=int, default=50000)
     parser.add_argument("--proj-lr", type=float, default=1e-3)
-    parser.add_argument("--attention-temperature", type=float, default=5.0,
-                        help="Temperature for softmax attention (higher = smoother)")
     parser.add_argument("--use-mlp", action="store_true")
     parser.add_argument(
         "--loss-mode",
@@ -196,39 +195,33 @@ def select_similarity_fn(loss_mode: str):
 
 
 # ---------------------------------------------------------------------------
-# Feature extraction with concept-aware spatial pooling
+# Feature extraction: mean-pool backbone + max-pool concept logits -> concat
 # ---------------------------------------------------------------------------
 
-def extract_concept_aware_features(
+def extract_concat_features(
     loader: DataLoader,
     model: VideoMAELocalizer,
-    pool: ConceptAwareSpatialPool,
     fc_norm: nn.Module,
     device: torch.device,
     desc: str,
-    temperature: float = 5.0,
 ) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
-    """Extract concept-aware global features.
+    """Extract concatenated [backbone_global ; concept_logit_pooled] features.
 
     Returns:
-        pooled_features: [N, D]
+        features: [N, D + C]
         labels: [N]
         sample_ids: list of length N
     """
-    pooled_batches: list[torch.Tensor] = []
+    feat_batches: list[torch.Tensor] = []
     label_batches: list[torch.Tensor] = []
     sample_ids: list[str] = []
-    # raw logit diagnostics
+    # diagnostics
     logit_min_acc = float("inf")
     logit_max_acc = float("-inf")
     logit_sum = 0.0
     logit_spatial_std_sum = 0.0
-    logit_spatial_range_sum = 0.0
-    # importance map diagnostics
-    imp_min_acc = float("inf")
-    imp_max_acc = float("-inf")
-    imp_std_sum = 0.0
-    imp_max_sum = 0.0
+    pooled_logit_mean_sum = 0.0
+    pooled_logit_std_sum = 0.0
     n_batches = 0
 
     progress = tqdm(loader, desc=desc, dynamic_ncols=True)
@@ -240,31 +233,28 @@ def extract_concept_aware_features(
             # feature_map:    [B, D, T, H, W]
 
             B, C, T, H, W = concept_logits.shape
-            S = T * H * W
 
-            # -- raw logit diagnostics --
-            logit_flat = concept_logits.view(B, C, -1)
+            # -- backbone: mean pool + fc_norm -> [B, D] --
+            backbone_feat = feature_map.mean(dim=(2, 3, 4))   # [B, D]
+            backbone_feat = fc_norm(backbone_feat)             # [B, D]
+
+            # -- localizer: max pool over spatial dims -> [B, C] --
+            logit_flat = concept_logits.view(B, C, -1)         # [B, C, T*H*W]
+            concept_pooled = logit_flat.max(dim=2).values      # [B, C]
+
+            # -- concat -> [B, D+C] --
+            concat_feat = torch.cat([backbone_feat, concept_pooled], dim=1)
+
+            # -- diagnostics --
             logit_min_acc = min(logit_min_acc, concept_logits.min().item())
             logit_max_acc = max(logit_max_acc, concept_logits.max().item())
             logit_sum += concept_logits.mean().item()
             logit_spatial_std_sum += logit_flat.std(dim=2).mean().item()
-            logit_spatial_range_sum += (
-                logit_flat.max(dim=2).values - logit_flat.min(dim=2).values
-            ).mean().item()
-
-            # -- importance map diagnostics --
-            attn = torch.softmax(logit_flat / temperature, dim=-1)  # [B, C, S]
-            importance, _ = attn.max(dim=1)                          # [B, S]
-            importance = importance / importance.sum(dim=1, keepdim=True)
-            imp_min_acc = min(imp_min_acc, importance.min().item())
-            imp_max_acc = max(imp_max_acc, importance.max().item())
-            imp_std_sum += importance.std(dim=1).mean().item()
-            imp_max_sum += importance.max(dim=1).values.mean().item()
+            pooled_logit_mean_sum += concept_pooled.mean().item()
+            pooled_logit_std_sum += concept_pooled.std().item()
             n_batches += 1
 
-            pooled = pool(feature_map, concept_logits)  # [B, D]
-            pooled = fc_norm(pooled)                      # [B, D]
-            pooled_batches.append(pooled.cpu())
+            feat_batches.append(concat_feat.cpu())
             label_batches.append(labels.cpu())
             sample_ids.extend(str(meta["sample_id"]) for meta in metas)
 
@@ -273,24 +263,19 @@ def extract_concept_aware_features(
     print(f"  global min={logit_min_acc:.4f}, max={logit_max_acc:.4f}, "
           f"mean={logit_sum / n_batches:.4f}")
     print(f"  spatial std (per concept, avg): {logit_spatial_std_sum / n_batches:.4f}")
-    print(f"  spatial range (max-min, per concept, avg): {logit_spatial_range_sum / n_batches:.4f}")
-
-    uniform_val = 1.0 / S
-    print(f"[{desc}] Importance map stats (temperature={temperature}):")
-    print(f"  min={imp_min_acc:.6f}, max={imp_max_acc:.6f}")
-    print(f"  spatial std (avg): {imp_std_sum / n_batches:.6f}")
-    print(f"  max weight (avg): {imp_max_sum / n_batches:.6f}")
-    print(f"  uniform baseline: {uniform_val:.6f}")
+    print(f"[{desc}] Pooled concept logit stats (max-pool):")
+    print(f"  mean={pooled_logit_mean_sum / n_batches:.4f}, "
+          f"std={pooled_logit_std_sum / n_batches:.4f}")
 
     return (
-        torch.cat(pooled_batches, dim=0),
+        torch.cat(feat_batches, dim=0),
         torch.cat(label_batches, dim=0),
         sample_ids,
     )
 
 
 # ---------------------------------------------------------------------------
-# W_c: Linear(D, C)  [N, D] -> [N, C]
+# W_c: Linear(D+C, C)  [N, D+C] -> [N, C]
 # ---------------------------------------------------------------------------
 
 def train_concept_projection(
@@ -301,13 +286,13 @@ def train_concept_projection(
     val_labels: torch.Tensor,
     save_dir: Path,
 ) -> tuple[torch.Tensor, float]:
-    """Train W_c: Linear(D, C).
+    """Train W_c: Linear(D+C, C).
 
     Returns:
-        w_c: [C, D] best weight matrix
+        w_c: [C, D+C] best weight matrix
         best_val_loss: float
     """
-    embed_dim = train_features.shape[1]
+    input_dim = train_features.shape[1]
     num_concepts = train_labels.shape[1]
 
     # Prepare targets
@@ -331,15 +316,15 @@ def train_concept_projection(
     val_feat_valid = val_features[val_valid]
     val_tgt_valid = val_targets[val_valid]
 
-    proj_layer = nn.Linear(embed_dim, num_concepts, bias=False).to(args.device)
+    proj_layer = nn.Linear(input_dim, num_concepts, bias=False).to(args.device)
     if args.use_mlp:
         nn.init.xavier_uniform_(proj_layer.weight)
         criterion = nn.BCEWithLogitsLoss()
     similarity_fn = None if args.use_mlp else select_similarity_fn(args.loss_mode)
     optimizer = torch.optim.Adam(proj_layer.parameters(), lr=args.proj_lr)
 
-    print(f"W_c params: Linear({embed_dim}, {num_concepts}), "
-          f"total={embed_dim * num_concepts}")
+    print(f"W_c params: Linear({input_dim}, {num_concepts}), "
+          f"total={input_dim * num_concepts}")
 
     indices = list(range(len(train_feat_valid)))
     proj_batch_size = min(args.proj_batch_size, len(train_feat_valid))
@@ -504,12 +489,10 @@ def main() -> None:
     device = torch.device(args.device)
 
     timestamp = datetime.now().strftime("%m-%d_%H-%M-%S")
-    temp_str = f"_temp{args.attention_temperature}" if args.attention_temperature != 1.0 else ""
     save_dir = args.save_dir / (
-        f"{args.data_set}_concept_aware_cbm"
+        f"{args.data_set}_concat_cbm"
         f"_block{args.block_index}"
         f"_{args.num_concepts}concepts"
-        f"{temp_str}"
         f"_{timestamp}"
     )
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -536,34 +519,28 @@ def main() -> None:
     for param in model.parameters():
         param.requires_grad = False
 
-    pool = ConceptAwareSpatialPool(temperature=args.attention_temperature)
-
-    # -- Extract fc_norm from the backbone (LayerNorm applied after pooling) --
+    # -- Extract fc_norm from the backbone --
     vmae_model = model.backbone.model
     fc_norm = vmae_model.fc_norm if vmae_model.fc_norm is not None else nn.Identity()
     fc_norm = fc_norm.to(device)
     fc_norm.eval()
     print(f"fc_norm: {fc_norm}")
 
-    # -- Extract concept-aware global features [N, D] --
-    print("Extracting concept-aware pooled features...")
-    train_features, train_y, train_sample_ids = extract_concept_aware_features(
+    # -- Extract concatenated features [N, D+C] --
+    print("Extracting concatenated features...")
+    train_features, train_y, train_sample_ids = extract_concat_features(
         loader=train_loader,
         model=model,
-        pool=pool,
         fc_norm=fc_norm,
         device=device,
         desc="extract-train",
-        temperature=args.attention_temperature,
     )
-    val_features, val_y, val_sample_ids = extract_concept_aware_features(
+    val_features, val_y, val_sample_ids = extract_concat_features(
         loader=val_loader,
         model=model,
-        pool=pool,
         fc_norm=fc_norm,
         device=device,
         desc="extract-val",
-        temperature=args.attention_temperature,
     )
 
     if train_labels != train_y.tolist():
@@ -571,14 +548,19 @@ def main() -> None:
     if val_labels != val_y.tolist():
         raise ValueError("Val label order mismatch.")
 
-    print(f"Train features: {tuple(train_features.shape)}")
+    D = train_features.shape[1] - args.num_concepts
+    print(f"Train features: {tuple(train_features.shape)} "
+          f"(backbone={D}, concept_logits={args.num_concepts})")
     print(f"Val features:   {tuple(val_features.shape)}")
 
     # -- Feature distribution diagnostics --
-    feat_norm = train_features.norm(dim=1)
-    feat_std = train_features.std(dim=0)
-    print(f"Feature L2 norm: mean={feat_norm.mean():.2f}, std={feat_norm.std():.2f}")
-    print(f"Feature per-dim std: mean={feat_std.mean():.4f}, min={feat_std.min():.4f}, max={feat_std.max():.4f}")
+    backbone_part = train_features[:, :D]
+    concept_part = train_features[:, D:]
+    feat_norm = backbone_part.norm(dim=1)
+    print(f"Backbone feature L2 norm: mean={feat_norm.mean():.2f}, std={feat_norm.std():.2f}")
+    print(f"Concept logit (max-pooled): mean={concept_part.mean():.4f}, "
+          f"std={concept_part.std():.4f}, "
+          f"min={concept_part.min():.4f}, max={concept_part.max():.4f}")
     torch.save(train_features, save_dir / "train_features.pt")
     torch.save(val_features, save_dir / "val_features.pt")
 
@@ -601,7 +583,7 @@ def main() -> None:
     with open(save_dir / "concepts.txt", "w", encoding="utf-8") as f:
         f.write("\n".join(concepts))
 
-    # -- Train W_c: Linear(D, C) [N, D] -> [N, C] --
+    # -- Train W_c: Linear(D+C, C) [N, D+C] -> [N, C] --
     print("Training concept projection (W_c)...")
     w_c, best_val_loss = train_concept_projection(
         args=args,

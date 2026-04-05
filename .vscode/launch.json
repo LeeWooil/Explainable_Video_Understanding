@@ -127,7 +127,7 @@
         "--nb-classes", "6",
         "--num-concepts", "21",
         "--batch-size", "16",
-        "--num-workers", "4",
+        "--num-workers", "0",
         "--device", "cuda",
         "--block-index", "11",
         "--num-frames", "16",
