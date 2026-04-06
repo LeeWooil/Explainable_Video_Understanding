@@ -83,6 +83,8 @@ def parse_args() -> argparse.Namespace:
         choices=["concept", "sample", "second", "first_concept", "first_sample"],
     )
     parser.add_argument("--no-filter-out", action="store_true")
+    # concept pooling
+    parser.add_argument("--concept-pooling", choices=["max", "flatten"], default="max")
     # W_g training
     parser.add_argument("--saga-batch-size", type=int, default=256)
     parser.add_argument("--lam", type=float, default=0.0007)
@@ -204,6 +206,7 @@ def extract_concat_features(
     fc_norm: nn.Module,
     device: torch.device,
     desc: str,
+    concept_pooling: str = "max",
 ) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
     """Extract concatenated [backbone_global ; concept_logit_pooled] features.
 
@@ -238,9 +241,12 @@ def extract_concat_features(
             backbone_feat = feature_map.mean(dim=(2, 3, 4))   # [B, D]
             backbone_feat = fc_norm(backbone_feat)             # [B, D]
 
-            # -- localizer: max pool over spatial dims -> [B, C] --
+            # -- localizer: pool concept logits --
             logit_flat = concept_logits.view(B, C, -1)         # [B, C, T*H*W]
-            concept_pooled = logit_flat.max(dim=2).values      # [B, C]
+            if concept_pooling == "flatten":
+                concept_pooled = concept_logits.reshape(B, -1) # [B, C*T*H*W]
+            else:
+                concept_pooled = logit_flat.max(dim=2).values  # [B, C]
 
             # -- concat -> [B, D+C] --
             concat_feat = torch.cat([backbone_feat, concept_pooled], dim=1)
@@ -263,7 +269,7 @@ def extract_concat_features(
     print(f"  global min={logit_min_acc:.4f}, max={logit_max_acc:.4f}, "
           f"mean={logit_sum / n_batches:.4f}")
     print(f"  spatial std (per concept, avg): {logit_spatial_std_sum / n_batches:.4f}")
-    print(f"[{desc}] Pooled concept logit stats (max-pool):")
+    print(f"[{desc}] Pooled concept logit stats ({concept_pooling}-pool):")
     print(f"  mean={pooled_logit_mean_sum / n_batches:.4f}, "
           f"std={pooled_logit_std_sum / n_batches:.4f}")
 
@@ -526,7 +532,7 @@ def main() -> None:
     fc_norm.eval()
     print(f"fc_norm: {fc_norm}")
 
-    # -- Extract concatenated features [N, D+C] --
+    # -- Extract concatenated features [N, D+C] or [N, D+C*T*H*W] --
     print("Extracting concatenated features...")
     train_features, train_y, train_sample_ids = extract_concat_features(
         loader=train_loader,
@@ -534,6 +540,7 @@ def main() -> None:
         fc_norm=fc_norm,
         device=device,
         desc="extract-train",
+        concept_pooling=args.concept_pooling,
     )
     val_features, val_y, val_sample_ids = extract_concat_features(
         loader=val_loader,
@@ -541,6 +548,7 @@ def main() -> None:
         fc_norm=fc_norm,
         device=device,
         desc="extract-val",
+        concept_pooling=args.concept_pooling,
     )
 
     if train_labels != train_y.tolist():

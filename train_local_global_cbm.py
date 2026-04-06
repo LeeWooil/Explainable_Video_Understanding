@@ -56,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-prefix", dest="model_prefix", type=str, default="")
     parser.add_argument("--deterministic-spatial", dest="deterministic_spatial", action="store_true")
     parser.add_argument("--localizer-ckpt", type=Path, required=True)
-    parser.add_argument("--pooling", choices=["mean", "max", "mean_max"], default="mean")
+    parser.add_argument("--pooling", choices=["mean", "max", "mean_max", "flatten"], default="mean")
     parser.add_argument("--pool-source", choices=["prob", "logit"], default="prob")
     parser.add_argument("--global-label-dir", type=Path, required=True)
     parser.add_argument("--video-anno-path", type=Path, required=True)
@@ -139,6 +139,10 @@ def pool_local_maps(logits: torch.Tensor, pooling: str, source: str) -> torch.Te
         pooled_mean = maps.mean(dim=(2, 3, 4))
         pooled_max = maps.amax(dim=(2, 3, 4))
         return torch.cat([pooled_mean, pooled_max], dim=1)
+    if pooling == "flatten":
+        # [B, C, T, H, W] -> [B, C*T*H*W]
+        B = maps.shape[0]
+        return maps.reshape(B, -1)
     raise ValueError(f"Unsupported pooling mode: {pooling}")
 
 
