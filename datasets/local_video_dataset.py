@@ -145,36 +145,39 @@ class LocalVideoDataset(Dataset):
         )
 
     def _transform_frames(self, frames: np.ndarray) -> tuple[torch.Tensor, dict[str, Any]]:
-        frame_list = [Image.fromarray(frame) for frame in frames]
-        if self.view_mode == "random" and not self.deterministic:
-            frame_list = self.aug_transform(frame_list)
-        frame_tensors = [self.rgb_transform(frame) for frame in frame_list]
-        video = torch.stack(frame_tensors, dim=0)  # T,C,H,W
-
         if self.view_mode == "center_uniform" or self.deterministic:
-            # PCBEAR-compatible: Resize short side -> CenterCrop -> Normalize
-            _, _, h, w = video.shape
-            if h < w:
-                new_h = self.short_side_size
-                new_w = int(w * new_h / h)
-            else:
+            # PCBEAR-compatible: cv2 resize on uint8 numpy -> CenterCrop -> ToTensor -> Normalize
+            import cv2
+            h, w = frames.shape[1], frames.shape[2]
+            if (w <= h and w == self.short_side_size) or (h <= w and h == self.short_side_size):
+                new_h, new_w = h, w
+            elif w < h:
                 new_w = self.short_side_size
-                new_h = int(h * new_w / w)
-            video = torch.nn.functional.interpolate(
-                video, size=(new_h, new_w), mode="bilinear", align_corners=False
-            )
-            # CenterCrop to input_size
+                new_h = int(self.short_side_size * h / w)
+            else:
+                new_h = self.short_side_size
+                new_w = int(self.short_side_size * w / h)
+            # Resize each frame using cv2 (matches PCBEAR's video_transforms.Resize)
+            resized = np.stack([
+                cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                for frame in frames
+            ])  # [T, new_h, new_w, C] uint8
+            # CenterCrop
             crop_h = crop_w = self.input_size
             top = max((new_h - crop_h) // 2, 0)
             left = max((new_w - crop_w) // 2, 0)
             crop_params = (top, left, crop_h, crop_w)
-            video = video[:, :, top : top + crop_h, left : left + crop_w]
-            # Normalize
-            video = video.permute(0, 2, 3, 1)  # T,H,W,C
+            cropped = resized[:, top : top + crop_h, left : left + crop_w, :]
+            # ToTensor (uint8 0-255 -> float32 0-1) + Normalize
+            video = torch.from_numpy(cropped).float() / 255.0  # [T, H, W, C]
             video = _tensor_normalize(video, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
             video = video.permute(3, 0, 1, 2)  # C,T,H,W
         else:
             # Training augmentation: Normalize -> RandomCrop -> Resize
+            frame_list = [Image.fromarray(frame) for frame in frames]
+            frame_list = self.aug_transform(frame_list)
+            frame_tensors = [self.rgb_transform(frame) for frame in frame_list]
+            video = torch.stack(frame_tensors, dim=0)  # T,C,H,W
             video = video.permute(0, 2, 3, 1)  # T,H,W,C
             video = _tensor_normalize(video, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
             video = video.permute(3, 0, 1, 2)  # C,T,H,W
@@ -245,7 +248,7 @@ class LocalConceptVideoDataset(LocalVideoDataset):
         video, label, meta = super().__getitem__(index)
         cache_path = self._target_cache_path(meta)
         if cache_path is not None and cache_path.exists():
-            target = torch.load(cache_path, map_location="cpu")
+            target = torch.load(cache_path, map_location="cpu", weights_only=True)
         else:
             target = build_target_from_meta(
                 meta=meta,

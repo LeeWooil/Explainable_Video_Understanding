@@ -1,10 +1,16 @@
-"""Train a global CBM using concept-aware spatial pooling.
+"""Train a global CBM using per-concept attention pooling.
 
 Pipeline:
   Video -> FrozenLocalizer -> (concept_logits [B,C,T,H,W], feature_map [B,D,T,H,W])
-       -> ConceptAwareSpatialPool -> [B, D]  (concept-guided global feature)
-       -> W_c Linear(D, C) -> [B, C]  (concept scores, supervised by global labels)
+       -> ConceptGuidedAttentionPool -> [B, C, D]  (per-concept attended features)
+       -> fc_norm (LayerNorm)
+       -> W_c [C, D] per-concept projection: score[c] = W_c[c] · feat[c] -> [B, C]
        -> W_g (GLM-SAGA sparse classifier) -> [B, num_classes]
+
+Key difference from train_attn_global_cbm.py:
+  - Each concept pools its OWN spatial region from the backbone features
+  - Concept scores come from concept-specific features, not a shared global feature
+  - W_c[c] is a per-concept weight vector [D], each row operates on its own attended feature
 """
 from __future__ import annotations
 
@@ -24,7 +30,7 @@ from tqdm.auto import tqdm
 
 from configs.defaults import build_videomae_args
 from datasets.local_video_dataset import LocalVideoDataset, _build_sample_id
-from models.attention_pool import ConceptAwareSpatialPool
+from models.attention_pool import ConceptGuidedAttentionPool
 from models.backbone import FrozenVideoMAEBackbone
 from models.localizer import VideoMAELocalizer
 
@@ -35,7 +41,7 @@ from models.localizer import VideoMAELocalizer
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        "Train a global CBM with concept-aware spatial pooling."
+        "Train a global CBM with per-concept attention pooling."
     )
     # data
     parser.add_argument("--anno-path", type=Path, required=True)
@@ -77,16 +83,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--proj-lr", type=float, default=1e-3)
     parser.add_argument("--attention-temperature", type=float, default=5.0,
                         help="Temperature for softmax attention (higher = smoother)")
-    parser.add_argument("--attention-mode", type=str, default="softmax",
-                        choices=["softmax", "sigmoid"],
-                        help="Attention function: softmax (competitive) or sigmoid (independent)")
-    parser.add_argument("--use-mlp", action="store_true")
-    parser.add_argument(
-        "--loss-mode",
-        default="concept",
-        choices=["concept", "sample", "second", "first_concept", "first_sample"],
-    )
-    parser.add_argument("--no-filter-out", action="store_true")
     # W_g training
     parser.add_argument("--saga-batch-size", type=int, default=256)
     parser.add_argument("--lam", type=float, default=0.0007)
@@ -183,55 +179,29 @@ def validate_alignment(
         )
 
 
-def select_similarity_fn(loss_mode: str):
-    from utils import similarity
-
-    lookup = {
-        "concept": similarity.cos_similarity_cubed_single_concept,
-        "sample": similarity.cos_similarity_cubed_single_sample,
-        "second": similarity.cos_similarity_cubed_single_secondpower,
-        "first_concept": similarity.cos_similarity_cubed_single_firstpower_concept,
-        "first_sample": similarity.cos_similarity_cubed_single_firstpower_sample,
-    }
-    if loss_mode not in lookup:
-        raise ValueError(f"Unsupported loss_mode: {loss_mode}")
-    return lookup[loss_mode]
-
-
 # ---------------------------------------------------------------------------
-# Feature extraction with concept-aware spatial pooling
+# Feature extraction with per-concept attention pooling
 # ---------------------------------------------------------------------------
 
-def extract_concept_aware_features(
+def extract_perconcept_features(
     loader: DataLoader,
     model: VideoMAELocalizer,
-    pool: ConceptAwareSpatialPool,
+    pool: ConceptGuidedAttentionPool,
     fc_norm: nn.Module,
     device: torch.device,
     desc: str,
     temperature: float = 5.0,
 ) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
-    """Extract concept-aware global features.
+    """Extract per-concept attended features.
 
     Returns:
-        pooled_features: [N, D]
+        pooled_features: [N, C, D]  (per-concept features)
         labels: [N]
         sample_ids: list of length N
     """
     pooled_batches: list[torch.Tensor] = []
     label_batches: list[torch.Tensor] = []
     sample_ids: list[str] = []
-    # raw logit diagnostics
-    logit_min_acc = float("inf")
-    logit_max_acc = float("-inf")
-    logit_sum = 0.0
-    logit_spatial_std_sum = 0.0
-    logit_spatial_range_sum = 0.0
-    # importance map diagnostics
-    imp_min_acc = float("inf")
-    imp_max_acc = float("-inf")
-    imp_std_sum = 0.0
-    imp_max_sum = 0.0
     n_batches = 0
 
     progress = tqdm(loader, desc=desc, dynamic_ncols=True)
@@ -242,48 +212,34 @@ def extract_concept_aware_features(
             # concept_logits: [B, C, T, H, W]
             # feature_map:    [B, D, T, H, W]
 
-            B, C, T, H, W = concept_logits.shape
-            S = T * H * W
+            # Per-concept attention pooling -> [B, C, D]
+            pooled = pool(feature_map, concept_logits)
 
-            # -- raw logit diagnostics --
-            logit_flat = concept_logits.view(B, C, -1)
-            logit_min_acc = min(logit_min_acc, concept_logits.min().item())
-            logit_max_acc = max(logit_max_acc, concept_logits.max().item())
-            logit_sum += concept_logits.mean().item()
-            logit_spatial_std_sum += logit_flat.std(dim=2).mean().item()
-            logit_spatial_range_sum += (
-                logit_flat.max(dim=2).values - logit_flat.min(dim=2).values
-            ).mean().item()
+            # Apply LayerNorm per concept (over D dimension)
+            B, C, D = pooled.shape
+            pooled_flat = pooled.view(B * C, D)
+            pooled_flat = fc_norm(pooled_flat)
+            pooled = pooled_flat.view(B, C, D)
 
-            # -- importance map diagnostics --
-            attn = torch.softmax(logit_flat / temperature, dim=-1)  # [B, C, S]
-            importance, _ = attn.max(dim=1)                          # [B, S]
-            importance = importance / importance.sum(dim=1, keepdim=True)
-            imp_min_acc = min(imp_min_acc, importance.min().item())
-            imp_max_acc = max(imp_max_acc, importance.max().item())
-            imp_std_sum += importance.std(dim=1).mean().item()
-            imp_max_sum += importance.max(dim=1).values.mean().item()
-            n_batches += 1
-
-            pooled = pool(feature_map, concept_logits)  # [B, D]
-            pooled = fc_norm(pooled)                      # [B, D]
             pooled_batches.append(pooled.cpu())
             label_batches.append(labels.cpu())
             sample_ids.extend(str(meta["sample_id"]) for meta in metas)
 
-    # -- print diagnostics --
-    print(f"[{desc}] Raw logit stats:")
-    print(f"  global min={logit_min_acc:.4f}, max={logit_max_acc:.4f}, "
-          f"mean={logit_sum / n_batches:.4f}")
-    print(f"  spatial std (per concept, avg): {logit_spatial_std_sum / n_batches:.4f}")
-    print(f"  spatial range (max-min, per concept, avg): {logit_spatial_range_sum / n_batches:.4f}")
+            if n_batches == 0:
+                print(f"[{desc}] concept_logits: {tuple(concept_logits.shape)}")
+                print(f"[{desc}] feature_map: {tuple(feature_map.shape)}")
+                print(f"[{desc}] pooled: {tuple(pooled.shape)}")
 
-    uniform_val = 1.0 / S
-    print(f"[{desc}] Importance map stats (temperature={temperature}):")
-    print(f"  min={imp_min_acc:.6f}, max={imp_max_acc:.6f}")
-    print(f"  spatial std (avg): {imp_std_sum / n_batches:.6f}")
-    print(f"  max weight (avg): {imp_max_sum / n_batches:.6f}")
-    print(f"  uniform baseline: {uniform_val:.6f}")
+                # Attention diagnostics
+                logit_flat = concept_logits.view(B, C, -1)
+                attn = torch.softmax(logit_flat / temperature, dim=-1)
+                S = logit_flat.shape[-1]
+                uniform = 1.0 / S
+                print(f"[{desc}] Attention stats (temp={temperature}):")
+                print(f"  spatial std (avg): {attn.std(dim=-1).mean():.6f}")
+                print(f"  max weight (avg): {attn.max(dim=-1).values.mean():.6f}")
+                print(f"  uniform baseline: {uniform:.6f}")
+            n_batches += 1
 
     return (
         torch.cat(pooled_batches, dim=0),
@@ -293,56 +249,57 @@ def extract_concept_aware_features(
 
 
 # ---------------------------------------------------------------------------
-# W_c: Linear(D, C)  [N, D] -> [N, C]
+# W_c: per-concept projection  W_c[c] · feat[c] -> score[c]
+# W_c shape: [C, D],  features shape: [N, C, D]  ->  scores: [N, C]
 # ---------------------------------------------------------------------------
+
+def _perconcept_forward(weight: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
+    """Apply per-concept projection: score[b,c] = W_c[c] · feat[b,c].
+
+    Args:
+        weight: [C, D]
+        features: [B, C, D]
+    Returns:
+        scores: [B, C]
+    """
+    return torch.einsum("cd, bcd -> bc", weight, features)
+
 
 def train_concept_projection(
     args: argparse.Namespace,
-    train_features: torch.Tensor,
-    val_features: torch.Tensor,
-    train_labels: torch.Tensor,
-    val_labels: torch.Tensor,
+    train_features: torch.Tensor,   # [N, C, D]
+    val_features: torch.Tensor,     # [N, C, D]
+    train_labels: torch.Tensor,     # [N, C]
+    val_labels: torch.Tensor,       # [N, C]
     save_dir: Path,
 ) -> tuple[torch.Tensor, float]:
-    """Train W_c: Linear(D, C).
+    """Train W_c with per-concept independent projections.
+
+    Each concept c has its own weight vector W_c[c] of shape [D].
+    score[b, c] = W_c[c] · features[b, c]
 
     Returns:
-        w_c: [C, D] best weight matrix
+        best_weights: [C, D] weight matrix
         best_val_loss: float
     """
-    embed_dim = train_features.shape[1]
-    num_concepts = train_labels.shape[1]
+    N_train, C, D = train_features.shape
 
-    # Prepare targets
-    train_targets = train_labels.clone()
-    val_targets = val_labels.clone()
-    if not args.use_mlp:
-        train_targets[train_targets == 0.0] = 0.05
-        train_targets[train_targets == 1.0] = 0.3
-        val_targets[val_targets == 0.0] = 0.05
-        val_targets[val_targets == 1.0] = 0.3
-
-    if args.no_filter_out:
-        train_targets[train_targets == -1.0] = 1e-8
-        val_targets[val_targets == -1.0] = 1e-8
-
-    # Filter valid samples (not all -1)
-    train_valid = torch.where(train_targets.max(dim=1).values != -1)[0]
-    val_valid = torch.where(val_targets.max(dim=1).values != -1)[0]
-    train_feat_valid = train_features[train_valid]
-    train_tgt_valid = train_targets[train_valid]
+    # Filter valid samples (not all -1 in global labels)
+    train_valid = torch.where(train_labels.max(dim=1).values != -1)[0]
+    val_valid = torch.where(val_labels.max(dim=1).values != -1)[0]
+    train_feat_valid = train_features[train_valid]   # [N', C, D]
+    train_tgt_valid = train_labels[train_valid]      # [N', C]
     val_feat_valid = val_features[val_valid]
-    val_tgt_valid = val_targets[val_valid]
+    val_tgt_valid = val_labels[val_valid]
 
-    proj_layer = nn.Linear(embed_dim, num_concepts, bias=False).to(args.device)
-    if args.use_mlp:
-        nn.init.xavier_uniform_(proj_layer.weight)
-        criterion = nn.BCEWithLogitsLoss()
-    similarity_fn = None if args.use_mlp else select_similarity_fn(args.loss_mode)
-    optimizer = torch.optim.Adam(proj_layer.parameters(), lr=args.proj_lr)
+    # W_c: [C, D] — each row is a per-concept projection vector
+    w_c = nn.Parameter(torch.empty(C, D, device=args.device))
+    nn.init.xavier_uniform_(w_c)
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.Adam([w_c], lr=args.proj_lr)
 
-    print(f"W_c params: Linear({embed_dim}, {num_concepts}), "
-          f"total={embed_dim * num_concepts}")
+    print(f"W_c params: per-concept projection [{C}, {D}], "
+          f"total={C * D} trainable params")
 
     indices = list(range(len(train_feat_valid)))
     proj_batch_size = min(args.proj_batch_size, len(train_feat_valid))
@@ -352,61 +309,44 @@ def train_concept_projection(
 
     for step in range(args.proj_steps):
         batch_idx = torch.LongTensor(random.sample(indices, k=proj_batch_size))
-        batch_feat = train_feat_valid[batch_idx].to(args.device).detach()
-        batch_tgt = train_tgt_valid[batch_idx].to(args.device).detach()
+        batch_feat = train_feat_valid[batch_idx].to(args.device)   # [B, C, D]
+        batch_tgt = train_tgt_valid[batch_idx].to(args.device)     # [B, C]
 
-        outputs = proj_layer(batch_feat)
+        outputs = _perconcept_forward(w_c, batch_feat)             # [B, C]
 
-        if args.use_mlp:
-            loss = criterion(outputs, batch_tgt)
-        else:
-            loss = -similarity_fn(batch_tgt, outputs)
-        loss = torch.mean(loss)
-
+        loss = criterion(outputs, batch_tgt)
         loss.backward()
         optimizer.step()
         optimizer.zero_grad()
 
         if step % 50 == 0 or step == args.proj_steps - 1:
             with torch.no_grad():
-                val_out = proj_layer(val_feat_valid.to(args.device))
-                if args.use_mlp:
-                    val_loss = criterion(val_out, val_tgt_valid.to(args.device))
-                else:
-                    val_loss = -similarity_fn(val_tgt_valid.to(args.device), val_out)
-                val_loss = torch.mean(val_loss)
+                val_out = _perconcept_forward(w_c, val_feat_valid.to(args.device))
+                val_loss = criterion(val_out, val_tgt_valid.to(args.device))
 
             if step == 0 or val_loss <= best_val_loss:
-                best_val_loss = val_loss
+                best_val_loss = val_loss.item()
                 best_step = step
-                best_weights = proj_layer.weight.clone().detach().cpu()
+                best_weights = w_c.clone().detach().cpu()
 
-            score = val_loss.item() if args.use_mlp else -val_loss.item()
-            train_score = loss.item() if args.use_mlp else -loss.item()
             print(
-                f"Step:{step}, Avg train similarity:{train_score:.4f}, "
-                f"Avg val similarity:{score:.4f}"
+                f"Step:{step}, Train loss:{loss.item():.4f}, "
+                f"Val loss:{val_loss.item():.4f}"
             )
 
     assert best_weights is not None
-    print(
-        f"Best step:{best_step}, Avg val similarity:"
-        f"{(-best_val_loss if not args.use_mlp else best_val_loss).item():.4f}"
-    )
+    print(f"Best step:{best_step}, Best val loss:{best_val_loss:.4f}")
 
-    proj_layer.load_state_dict({"weight": best_weights})
-    proj_layer = proj_layer.cpu()
-
-    # Save
+    # Compute concept scores for normalization stats
     with torch.no_grad():
-        train_c = proj_layer(train_features.detach())
+        train_c = _perconcept_forward(best_weights, train_features)  # [N, C]
         train_mean = torch.mean(train_c, dim=0, keepdim=True)
         train_std = torch.std(train_c, dim=0, keepdim=True)
+
     torch.save(train_mean, save_dir / "proj_mean.pt")
     torch.save(train_std, save_dir / "proj_std.pt")
-    w_c = proj_layer.weight[:]
-    torch.save(w_c, save_dir / "W_c.pt")
-    return w_c, float(best_val_loss.item())
+    torch.save(best_weights, save_dir / "W_c.pt")
+    return best_weights, best_val_loss
 
 
 # ---------------------------------------------------------------------------
@@ -415,22 +355,18 @@ def train_concept_projection(
 
 def train_classifier(
     args: argparse.Namespace,
-    w_c: torch.Tensor,
-    train_features: torch.Tensor,
-    val_features: torch.Tensor,
-    train_y: torch.Tensor,
-    val_y: torch.Tensor,
+    w_c: torch.Tensor,              # [C, D]
+    train_features: torch.Tensor,   # [N, C, D]
+    val_features: torch.Tensor,     # [N, C, D]
+    train_y: torch.Tensor,          # [N]
+    val_y: torch.Tensor,            # [N]
     save_dir: Path,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Project features through W_c, normalize, then train sparse W_g."""
-    proj_layer = nn.Linear(
-        w_c.shape[1], w_c.shape[0], bias=False
-    )
-    proj_layer.load_state_dict({"weight": w_c})
-
     with torch.no_grad():
-        train_c = proj_layer(train_features.detach())
-        val_c = proj_layer(val_features.detach())
+        # [N, C, D] × [C, D] -> [N, C]
+        train_c = _perconcept_forward(w_c, train_features)
+        val_c = _perconcept_forward(w_c, val_features)
 
         train_mean = torch.mean(train_c, dim=0, keepdim=True)
         train_std = torch.std(train_c, dim=0, keepdim=True).clamp_min(1e-6)
@@ -457,7 +393,8 @@ def train_classifier(
         f"args.nb_classes ({args.nb_classes}) != len(classes) ({len(classes)})"
     )
 
-    linear = nn.Linear(train_c.shape[1], len(classes)).to(args.device)
+    num_concepts = train_c.shape[1]
+    linear = nn.Linear(num_concepts, len(classes)).to(args.device)
     linear.weight.data.zero_()
     linear.bias.data.zero_()
 
@@ -509,7 +446,7 @@ def main() -> None:
     timestamp = datetime.now().strftime("%m-%d_%H-%M-%S")
     temp_str = f"_temp{args.attention_temperature}" if args.attention_temperature != 1.0 else ""
     save_dir = args.save_dir / (
-        f"{args.data_set}_concept_aware_cbm"
+        f"{args.data_set}_perconcept_cbm"
         f"_block{args.block_index}"
         f"_{args.num_concepts}concepts"
         f"{temp_str}"
@@ -533,14 +470,13 @@ def main() -> None:
     model_args = build_videomae_args(args)
     backbone = FrozenVideoMAEBackbone.from_args(model_args, device=device)
     model = VideoMAELocalizer(backbone, out_channels=args.num_concepts).to(device)
-    checkpoint = torch.load(args.localizer_ckpt, map_location="cpu")
+    checkpoint = torch.load(args.localizer_ckpt, map_location="cpu", weights_only=True)
     model.load_state_dict(checkpoint["model"], strict=True)
     model.eval()
     for param in model.parameters():
         param.requires_grad = False
 
-    pool = ConceptAwareSpatialPool(temperature=args.attention_temperature, mode=args.attention_mode)
-    print(f"Attention mode: {args.attention_mode}, temperature: {args.attention_temperature}")
+    pool = ConceptGuidedAttentionPool(temperature=args.attention_temperature)
 
     # -- Extract fc_norm from the backbone (LayerNorm applied after pooling) --
     vmae_model = model.backbone.model
@@ -549,9 +485,9 @@ def main() -> None:
     fc_norm.eval()
     print(f"fc_norm: {fc_norm}")
 
-    # -- Extract concept-aware global features [N, D] --
-    print("Extracting concept-aware pooled features...")
-    train_features, train_y, train_sample_ids = extract_concept_aware_features(
+    # -- Extract per-concept attended features [N, C, D] --
+    print("Extracting per-concept attended features...")
+    train_features, train_y, train_sample_ids = extract_perconcept_features(
         loader=train_loader,
         model=model,
         pool=pool,
@@ -560,7 +496,7 @@ def main() -> None:
         desc="extract-train",
         temperature=args.attention_temperature,
     )
-    val_features, val_y, val_sample_ids = extract_concept_aware_features(
+    val_features, val_y, val_sample_ids = extract_perconcept_features(
         loader=val_loader,
         model=model,
         pool=pool,
@@ -575,14 +511,14 @@ def main() -> None:
     if val_labels != val_y.tolist():
         raise ValueError("Val label order mismatch.")
 
-    print(f"Train features: {tuple(train_features.shape)}")
+    print(f"Train features: {tuple(train_features.shape)}")  # [N, C, D]
     print(f"Val features:   {tuple(val_features.shape)}")
 
     # -- Feature distribution diagnostics --
-    feat_norm = train_features.norm(dim=1)
-    feat_std = train_features.std(dim=0)
-    print(f"Feature L2 norm: mean={feat_norm.mean():.2f}, std={feat_norm.std():.2f}")
-    print(f"Feature per-dim std: mean={feat_std.mean():.4f}, min={feat_std.min():.4f}, max={feat_std.max():.4f}")
+    # Per-concept feature norms
+    feat_norm = train_features.norm(dim=2)  # [N, C]
+    print(f"Per-concept feature L2 norm: mean={feat_norm.mean():.2f}, std={feat_norm.std():.2f}")
+    print(f"Per-concept norm variation across concepts: {feat_norm.mean(dim=0).std():.4f}")
     torch.save(train_features, save_dir / "train_features.pt")
     torch.save(val_features, save_dir / "val_features.pt")
 
@@ -605,8 +541,8 @@ def main() -> None:
     with open(save_dir / "concepts.txt", "w", encoding="utf-8") as f:
         f.write("\n".join(concepts))
 
-    # -- Train W_c: Linear(D, C) [N, D] -> [N, C] --
-    print("Training concept projection (W_c)...")
+    # -- Train W_c: Linear(D, 1) shared across concepts --
+    print("Training per-concept projection (W_c)...")
     w_c, best_val_loss = train_concept_projection(
         args=args,
         train_features=train_features,
@@ -615,7 +551,7 @@ def main() -> None:
         val_labels=val_global_labels,
         save_dir=save_dir,
     )
-    print(f"Concept layer best val loss: {best_val_loss:.6f}")
+    print(f"Concept projection best val loss: {best_val_loss:.6f}")
 
     # -- Train W_g: sparse classifier via GLM-SAGA --
     print("Training sparse classifier (W_g)...")

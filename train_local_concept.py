@@ -144,15 +144,23 @@ def _precompute_target_cache(
     cli_args: argparse.Namespace,
 ) -> None:
     dataset = _build_dataset(anno_path=anno_path, data_root=data_root, cli_args=cli_args)
+    if _is_distributed():
+        sampler = DistributedSampler(dataset, shuffle=False)
+    else:
+        sampler = None
     loader = DataLoader(
         dataset,
         batch_size=1,
         shuffle=False,
+        sampler=sampler,
         num_workers=cli_args.num_workers,
         pin_memory=False,
         collate_fn=_collate_batch,
     )
-    progress = tqdm(loader, desc=f"target-cache-{anno_path.stem}", dynamic_ncols=True, disable=not _is_main_process())
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    desc = f"target-cache-{anno_path.stem} [rank {rank}/{world_size}]"
+    progress = tqdm(loader, desc=desc, dynamic_ncols=True)
     for _inputs, _labels, _targets, _metas in progress:
         pass
 
@@ -380,7 +388,7 @@ def _infer_num_concepts(mask_root: Path, anno_path: Path) -> int:
         mask_path = mask_root / sample_id / "pixel_mask.npy"
         if not mask_path.exists():
             continue
-        mask = torch.from_numpy(np.load(mask_path))
+        mask = np.load(mask_path, mmap_mode="r")
         if mask.ndim == 3:
             return 1
         if mask.ndim == 4:
@@ -417,18 +425,18 @@ def main() -> None:
                 raise ValueError("--precompute-target-cache requires --target-cache-root.")
             if cli_args.view_mode != "center_uniform":
                 raise ValueError("--precompute-target-cache is only supported with --view-mode center_uniform.")
-            if _is_main_process():
+            # All ranks participate in cache building (each processes its own shard)
+            _precompute_target_cache(
+                anno_path=cli_args.anno_path,
+                data_root=cli_args.data_root,
+                cli_args=cli_args,
+            )
+            if cli_args.val_anno_path is not None:
                 _precompute_target_cache(
-                    anno_path=cli_args.anno_path,
-                    data_root=cli_args.data_root,
+                    anno_path=cli_args.val_anno_path,
+                    data_root=cli_args.val_data_root or cli_args.data_root,
                     cli_args=cli_args,
                 )
-                if cli_args.val_anno_path is not None:
-                    _precompute_target_cache(
-                        anno_path=cli_args.val_anno_path,
-                        data_root=cli_args.val_data_root or cli_args.data_root,
-                        cli_args=cli_args,
-                    )
             if _is_distributed():
                 dist.barrier()
             if cli_args.precompute_target_cache_only:
