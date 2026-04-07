@@ -56,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-prefix", dest="model_prefix", type=str, default="")
     parser.add_argument("--deterministic-spatial", dest="deterministic_spatial", action="store_true")
     parser.add_argument("--localizer-ckpt", type=Path, required=True)
-    parser.add_argument("--pooling", choices=["mean", "max", "mean_max", "softmax"], default="mean")
+    parser.add_argument("--pooling", choices=["mean", "max", "mean_max", "softmax", "flatten"], default="mean")
     parser.add_argument("--pool-source", choices=["prob", "logit"], default="prob")
     parser.add_argument("--softmax-temperature", type=float, default=1.0,
                         help="Temperature for softmax pooling (higher = smoother, closer to mean)")
@@ -153,6 +153,10 @@ def pool_local_maps(
         attn = torch.softmax(logit_flat / temperature, dim=-1)     # [B, C, S]
         maps_flat = maps.view(B, C, -1)                            # [B, C, S]
         return (attn * maps_flat).sum(dim=-1)                      # [B, C]
+    if pooling == "flatten":
+        # [B, C, T, H, W] -> [B, C*T*H*W]
+        B = maps.shape[0]
+        return maps.reshape(B, -1)
     raise ValueError(f"Unsupported pooling mode: {pooling}")
 
 
