@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import math
+import numbers
 import random
 from collections.abc import Sequence
 
+import cv2
+import numpy as np
+import torch
 from PIL import Image
 from torchvision import transforms
 
@@ -68,3 +72,75 @@ def create_random_augment(
 ):
     del auto_augment
     return _FrameListRandAugment(input_size=input_size, interpolation=interpolation)
+
+
+class Compose:
+    def __init__(self, transforms_list: Sequence) -> None:
+        self.transforms = list(transforms_list)
+
+    def __call__(self, clip):
+        for transform in self.transforms:
+            clip = transform(clip)
+        return clip
+
+
+class Resize:
+    """Resize a list of HWC numpy frames while preserving aspect ratio."""
+
+    def __init__(self, size, interpolation: str = "nearest") -> None:
+        self.size = size
+        self.interpolation = interpolation
+
+    def __call__(self, clip: Sequence[np.ndarray]) -> list[np.ndarray]:
+        if not clip:
+            return []
+        if isinstance(self.size, numbers.Number):
+            target = int(self.size)
+            h, w = clip[0].shape[:2]
+            if (w <= h and w == target) or (h <= w and h == target):
+                new_h, new_w = h, w
+            elif w < h:
+                new_w = target
+                new_h = int(target * h / w)
+            else:
+                new_h = target
+                new_w = int(target * w / h)
+        else:
+            new_h, new_w = self.size
+        interpolation = cv2.INTER_LINEAR if self.interpolation == "bilinear" else cv2.INTER_NEAREST
+        return [cv2.resize(frame, (new_w, new_h), interpolation=interpolation) for frame in clip]
+
+
+class CenterCrop:
+    """Center crop a list of HWC numpy frames."""
+
+    def __init__(self, size) -> None:
+        if isinstance(size, numbers.Number):
+            size = (int(size), int(size))
+        self.size = tuple(size)
+
+    def __call__(self, clip: Sequence[np.ndarray]) -> list[np.ndarray]:
+        if not clip:
+            return []
+        crop_h, crop_w = self.size
+        im_h, im_w = clip[0].shape[:2]
+        if crop_w > im_w or crop_h > im_h:
+            raise ValueError(
+                f"Initial image size ({im_w}, {im_h}) must be >= crop size ({crop_w}, {crop_h})"
+            )
+        left = int(round((im_w - crop_w) / 2.0))
+        top = int(round((im_h - crop_h) / 2.0))
+        return [frame[top : top + crop_h, left : left + crop_w, :] for frame in clip]
+
+
+class Normalize:
+    """Normalize a clip tensor of shape C,T,H,W."""
+
+    def __init__(self, mean, std) -> None:
+        self.mean = mean
+        self.std = std
+
+    def __call__(self, clip: torch.Tensor) -> torch.Tensor:
+        mean = torch.tensor(self.mean, dtype=clip.dtype, device=clip.device).view(-1, 1, 1, 1)
+        std = torch.tensor(self.std, dtype=clip.dtype, device=clip.device).view(-1, 1, 1, 1)
+        return (clip - mean) / std

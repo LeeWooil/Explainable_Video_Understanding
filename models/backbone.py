@@ -109,9 +109,48 @@ class FrozenVideoMAEBackbone(nn.Module):
     @torch.no_grad()
     def forward_feature_map(self, x: torch.Tensor) -> torch.Tensor:
         tokens = self.forward_intermediate_tokens(x)
+        return self._tokens_to_feature_map(tokens)
+
+    def _tokens_to_feature_map(self, tokens: torch.Tensor) -> torch.Tensor:
         bsz, num_tokens, dim = tokens.shape
         expected = self.grid_t * self.grid_h * self.grid_w
         if num_tokens != expected:
             raise ValueError(f"Unexpected token count: got {num_tokens}, expected {expected}.")
         feature_map = tokens.view(bsz, self.grid_t, self.grid_h, self.grid_w, dim)
         return feature_map.permute(0, 4, 1, 2, 3).contiguous()
+
+    @torch.no_grad()
+    def forward_dual_feature_maps(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run all blocks (matching VideoMAE forward_features), return intermediate and final maps.
+
+        Returns:
+            intermediate_map: [B, D, T, H, W] — features at block_index (for concept head)
+            final_map:        [B, D, T, H, W] — features after all blocks + norm (for projection)
+        """
+        x = self.model.patch_embed(x)
+        bsz = x.shape[0]
+        if getattr(self.model, "pos_embed", None) is not None:
+            pos_embed = self.model.pos_embed.expand(bsz, -1, -1).type_as(x).to(x.device).clone().detach()
+            x = x + pos_embed
+        x = self.model.pos_drop(x)
+
+        intermediate = None
+        if getattr(self.model, "use_checkpoint", False):
+            from torch.utils.checkpoint import checkpoint
+            for idx, blk in enumerate(self.model.blocks):
+                x = checkpoint(blk, x)
+                if idx == self.block_index:
+                    intermediate = x.clone()
+        else:
+            for idx, blk in enumerate(self.model.blocks):
+                x = blk(x)
+                if idx == self.block_index:
+                    intermediate = x.clone()
+
+        if intermediate is None:
+            raise IndexError(f"block_index={self.block_index} out of range for {len(self.model.blocks)} blocks.")
+
+        # Apply encoder final norm (Identity when use_mean_pooling=True)
+        x = self.model.norm(x)
+
+        return self._tokens_to_feature_map(intermediate), self._tokens_to_feature_map(x)

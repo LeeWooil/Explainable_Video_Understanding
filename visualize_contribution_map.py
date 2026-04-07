@@ -282,18 +282,18 @@ def _draw_arrow(
 def _overlay_trajectory_arrows(
     base: np.ndarray,
     trajectory: np.ndarray,
-    contrib_map: np.ndarray,
+    anchor_xy: tuple[float, float],
     scale: float = 3.0,
     line_width: int = 4,
     arrow_size: float = 12.0,
 ) -> np.ndarray:
-    """Render arrow-shaped trajectory on the base image, anchored at peak activation.
+    """Render arrow-shaped trajectory on the base image, anchored at a given point.
 
     Parameters
     ----------
     base : [H, W, 3] uint8 image.
     trajectory : [L, 2] displacement vectors for this concept.
-    contrib_map : [H, W] float contribution map (used to find anchor point).
+    anchor_xy : (x, y) pixel coordinates to center the trajectory on.
     scale : Scale factor for trajectory displacements.
     line_width : Arrow shaft width.
     arrow_size : Arrowhead size.
@@ -302,18 +302,7 @@ def _overlay_trajectory_arrows(
     -------
     [H, W, 3] uint8 blended image.
     """
-    H, W = base.shape[:2]
-
-    # Find anchor at centroid of positive activation
-    pos_contrib = np.maximum(contrib_map, 0)
-    total = pos_contrib.sum()
-    if total < 1e-8:
-        anchor = np.array([W / 2.0, H / 2.0], dtype=np.float32)
-    else:
-        ys, xs = np.mgrid[:H, :W]
-        cy = (ys * pos_contrib).sum() / total
-        cx = (xs * pos_contrib).sum() / total
-        anchor = np.array([cx, cy], dtype=np.float32)
+    anchor = np.array(anchor_xy, dtype=np.float32)
 
     # Build cumulative trajectory points, scaled and anchored
     points = _build_cumulative_points(trajectory) * float(scale)
@@ -408,11 +397,6 @@ def main() -> None:
 
     pool = ConceptGuidedAttentionPool(temperature=args.attention_temperature)
 
-    # Extract fc_norm
-    vmae_model = model.backbone.model
-    fc_norm = vmae_model.fc_norm if vmae_model.fc_norm is not None else torch.nn.Identity()
-    fc_norm = fc_norm.to(device).eval()
-
     # Pre-load concept canvas images if available
     concept_canvases: dict[int, np.ndarray | None] = {}
     if args.concept_canvas_dir is not None:
@@ -452,7 +436,6 @@ def main() -> None:
         # --- Per-concept pooled features ---
         pooled = pool(feature_map, concept_logits)  # [1, C, D]
         pooled_flat = pooled.view(C, D)
-        pooled_flat = fc_norm(pooled_flat)  # LayerNorm per concept
 
         # --- Concept scores via per-concept W_c ---
         concept_scores = torch.einsum("cd, cd -> c", w_c, pooled_flat.cpu())  # [C]
@@ -479,9 +462,7 @@ def main() -> None:
         # relevance[c, t, h, w] = W_c[c] · backbone[t, h, w]
         feat_spatial = feature_map[0]  # [D, T, H, W]
 
-        # Apply fc_norm per position
         feat_for_proj = feat_spatial.permute(1, 2, 3, 0).reshape(-1, D)  # [S, D]
-        feat_for_proj = fc_norm(feat_for_proj)  # [S, D]
 
         # relevance[c, s] = W_c[c] · feat[s]
         relevance = torch.einsum("cd, sd -> cs", w_c.to(device), feat_for_proj)  # [C, S]
@@ -516,20 +497,36 @@ def main() -> None:
         p95 = torch.quantile(contribution.abs().float(), 0.95) if contribution.abs().max() > 0 else 1.0
         p95 = max(float(p95), 1e-8)
 
-        # Pre-compute per-concept data: peak timesteps + upsampled maps
+        # Pre-compute per-concept data: peak (t, h, w) positions + upsampled maps
         concept_vis_data = []
         for concept_idx in topk_indices:
             contrib_map = contribution[concept_idx]  # [T, H_grid, W_grid]
-            # Pick peak timesteps by total absolute contribution
-            temporal_strength = contrib_map.abs().sum(dim=(1, 2))  # [T]
-            peak_ts = temporal_strength.argsort(descending=True)[:n_peak].sort().values.tolist()
+
+            # Find top-N peak positions jointly in (T, H, W) by absolute contribution
+            flat_abs = contrib_map.abs().reshape(-1)
+            topk_flat = flat_abs.argsort(descending=True)
+            # Extract unique timesteps from top positions
+            seen_ts: set[int] = set()
+            peak_positions: list[tuple[int, int, int]] = []  # (t, h_grid, w_grid)
+            for fi in topk_flat.tolist():
+                t_i = fi // (H * W)
+                hw = fi % (H * W)
+                h_i = hw // W
+                w_i = hw % W
+                if t_i not in seen_ts:
+                    seen_ts.add(t_i)
+                    peak_positions.append((t_i, h_i, w_i))
+                    if len(peak_positions) >= n_peak:
+                        break
+            # Sort by timestep for chronological display
+            peak_positions.sort(key=lambda x: x[0])
 
             contrib_vis = (contrib_map / p95).clamp(-1, 1)
             contrib_up = _upsample_map(contrib_vis, input_size)  # [T, 224, 224]
 
             concept_vis_data.append({
                 "concept_idx": concept_idx,
-                "peak_ts": peak_ts,
+                "peak_positions": peak_positions,
                 "contrib_up": contrib_up,
                 "wg_weight": w_g[pred_class, concept_idx].item(),
                 "c_score": concept_scores[concept_idx].item(),
@@ -569,7 +566,7 @@ def main() -> None:
         import matplotlib.cm as cm
 
         for row_i, d in enumerate(concept_vis_data):
-            peak_ts = d["peak_ts"]
+            peak_positions = d["peak_positions"]
             contrib_up = d["contrib_up"]
             concept_idx = d["concept_idx"]
 
@@ -580,7 +577,11 @@ def main() -> None:
                 )
             canvas = concept_canvases.get(concept_idx)
 
-            for col_j, t in enumerate(peak_ts):
+            for col_j, (t, h_grid, w_grid) in enumerate(peak_positions):
+                # Convert grid-level peak (h_grid, w_grid) to pixel coordinates
+                anchor_x = (w_grid + 0.5) * input_size / W
+                anchor_y = (h_grid + 0.5) * input_size / H
+
                 frame_idx = min(t * args.tubelet_size, video.shape[1] - 1)
                 frame = _to_uint8_rgb(video[:, frame_idx])  # [H, W, 3]
                 contrib_hm = _apply_diverging_colormap(contrib_up[t].numpy())
@@ -590,7 +591,7 @@ def main() -> None:
                     overlay = _overlay_trajectory_arrows(
                         overlay,
                         trajectory_data[concept_idx],
-                        contrib_up[t].numpy(),
+                        (anchor_x, anchor_y),
                         scale=args.trajectory_scale,
                         line_width=args.arrow_line_width,
                         arrow_size=args.arrow_size,

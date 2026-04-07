@@ -16,6 +16,7 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 
 from utils import video_transforms as videomae_video_transforms
+from utils import volume_transforms
 from utils.pseudo_labels import build_target_from_meta
 
 
@@ -49,6 +50,27 @@ def _apply_crop_and_resize(images: torch.Tensor, crop_params: tuple[int, int, in
         mode="bilinear",
         align_corners=False,
     )
+
+
+def _compute_resize_and_center_crop_params(
+    height: int,
+    width: int,
+    short_side_size: int,
+    input_size: int,
+) -> tuple[int, int, int, int]:
+    if (width <= height and width == short_side_size) or (height <= width and height == short_side_size):
+        new_h, new_w = height, width
+    elif width < height:
+        new_w = short_side_size
+        new_h = int(short_side_size * height / width)
+    else:
+        new_h = short_side_size
+        new_w = int(short_side_size * width / height)
+
+    crop_h = crop_w = input_size
+    top = int(round((new_h - crop_h) / 2.0))
+    left = int(round((new_w - crop_w) / 2.0))
+    return top, left, crop_h, crop_w
 
 
 class LocalVideoDataset(Dataset):
@@ -86,6 +108,17 @@ class LocalVideoDataset(Dataset):
             input_size=(self.input_size, self.input_size),
             auto_augment="rand-m7-n4-mstd0.5-inc1",
             interpolation="bicubic",
+        )
+        self.eval_transform = videomae_video_transforms.Compose(
+            [
+                videomae_video_transforms.Resize(self.short_side_size, interpolation="bilinear"),
+                videomae_video_transforms.CenterCrop(size=(self.input_size, self.input_size)),
+                volume_transforms.ClipToTensor(),
+                videomae_video_transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225],
+                ),
+            ]
         )
 
     def __len__(self) -> int:
@@ -146,32 +179,14 @@ class LocalVideoDataset(Dataset):
 
     def _transform_frames(self, frames: np.ndarray) -> tuple[torch.Tensor, dict[str, Any]]:
         if self.view_mode == "center_uniform" or self.deterministic:
-            # PCBEAR-compatible: cv2 resize on uint8 numpy -> CenterCrop -> ToTensor -> Normalize
-            import cv2
             h, w = frames.shape[1], frames.shape[2]
-            if (w <= h and w == self.short_side_size) or (h <= w and h == self.short_side_size):
-                new_h, new_w = h, w
-            elif w < h:
-                new_w = self.short_side_size
-                new_h = int(self.short_side_size * h / w)
-            else:
-                new_h = self.short_side_size
-                new_w = int(self.short_side_size * w / h)
-            # Resize each frame using cv2 (matches PCBEAR's video_transforms.Resize)
-            resized = np.stack([
-                cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-                for frame in frames
-            ])  # [T, new_h, new_w, C] uint8
-            # CenterCrop
-            crop_h = crop_w = self.input_size
-            top = max((new_h - crop_h) // 2, 0)
-            left = max((new_w - crop_w) // 2, 0)
-            crop_params = (top, left, crop_h, crop_w)
-            cropped = resized[:, top : top + crop_h, left : left + crop_w, :]
-            # ToTensor (uint8 0-255 -> float32 0-1) + Normalize
-            video = torch.from_numpy(cropped).float() / 255.0  # [T, H, W, C]
-            video = _tensor_normalize(video, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-            video = video.permute(3, 0, 1, 2)  # C,T,H,W
+            video = self.eval_transform(list(frames))
+            crop_params = _compute_resize_and_center_crop_params(
+                height=h,
+                width=w,
+                short_side_size=self.short_side_size,
+                input_size=self.input_size,
+            )
         else:
             # Training augmentation: Normalize -> RandomCrop -> Resize
             frame_list = [Image.fromarray(frame) for frame in frames]
