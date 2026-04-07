@@ -56,8 +56,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-prefix", dest="model_prefix", type=str, default="")
     parser.add_argument("--deterministic-spatial", dest="deterministic_spatial", action="store_true")
     parser.add_argument("--localizer-ckpt", type=Path, required=True)
-    parser.add_argument("--pooling", choices=["mean", "max", "mean_max", "flatten"], default="mean")
+    parser.add_argument("--pooling", choices=["mean", "max", "mean_max", "softmax", "flatten"], default="mean")
     parser.add_argument("--pool-source", choices=["prob", "logit"], default="prob")
+    parser.add_argument("--softmax-temperature", type=float, default=1.0,
+                        help="Temperature for softmax pooling (higher = smoother, closer to mean)")
     parser.add_argument("--global-label-dir", type=Path, required=True)
     parser.add_argument("--video-anno-path", type=Path, required=True)
     parser.add_argument("--save-dir", type=Path, required=True)
@@ -74,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--saga-batch-size", type=int, default=256)
     parser.add_argument("--lam", type=float, default=0.0007)
     parser.add_argument("--n-iters", type=int, default=1000)
-    parser.add_argument("--fusion-mode", choices=["local", "concat", "gated", "learnable_gated"], default="local")
+    parser.add_argument("--fusion-mode", choices=["local", "concat", "gated", "learnable_gated", "multiply"], default="local")
     parser.add_argument("--fusion-gate", type=float, default=0.5)
     parser.add_argument("--gate-steps", type=int, default=1000)
     parser.add_argument("--gate-lr", type=float, default=1e-2)
@@ -129,7 +131,12 @@ def make_loader(
     return loader, list(dataset.label_array)
 
 
-def pool_local_maps(logits: torch.Tensor, pooling: str, source: str) -> torch.Tensor:
+def pool_local_maps(
+    logits: torch.Tensor,
+    pooling: str,
+    source: str,
+    temperature: float = 1.0,
+) -> torch.Tensor:
     maps = torch.sigmoid(logits) if source == "prob" else logits
     if pooling == "mean":
         return maps.mean(dim=(2, 3, 4))
@@ -139,6 +146,13 @@ def pool_local_maps(logits: torch.Tensor, pooling: str, source: str) -> torch.Te
         pooled_mean = maps.mean(dim=(2, 3, 4))
         pooled_max = maps.amax(dim=(2, 3, 4))
         return torch.cat([pooled_mean, pooled_max], dim=1)
+    if pooling == "softmax":
+        # Softmax-weighted average: positions with high logits contribute more
+        B, C, T, H, W = logits.shape
+        logit_flat = logits.view(B, C, -1)                         # [B, C, S]
+        attn = torch.softmax(logit_flat / temperature, dim=-1)     # [B, C, S]
+        maps_flat = maps.view(B, C, -1)                            # [B, C, S]
+        return (attn * maps_flat).sum(dim=-1)                      # [B, C]
     if pooling == "flatten":
         # [B, C, T, H, W] -> [B, C*T*H*W]
         B = maps.shape[0]
@@ -186,6 +200,7 @@ def extract_pooled_features(
     pooling: str,
     pool_source: str,
     desc: str,
+    temperature: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
     pooled_batches = []
     label_batches = []
@@ -195,7 +210,7 @@ def extract_pooled_features(
         for videos, labels, metas in progress:
             videos = videos.to(device, non_blocking=True)
             logits, _ = model(videos)
-            pooled = pool_local_maps(logits, pooling, pool_source)
+            pooled = pool_local_maps(logits, pooling, pool_source, temperature)
             pooled_batches.append(pooled.cpu())
             label_batches.append(labels.cpu())
             sample_ids.extend(str(meta["sample_id"]) for meta in metas)
@@ -605,6 +620,7 @@ def main() -> None:
         pooling=args.pooling,
         pool_source=args.pool_source,
         desc="extract-train",
+        temperature=args.softmax_temperature,
     )
     val_features, val_y, val_sample_ids = extract_pooled_features(
         loader=val_loader,
@@ -613,6 +629,7 @@ def main() -> None:
         pooling=args.pooling,
         pool_source=args.pool_source,
         desc="extract-val",
+        temperature=args.softmax_temperature,
     )
 
     if train_labels != train_y.tolist():
@@ -636,7 +653,7 @@ def main() -> None:
     with open(save_dir / "concepts.txt", "w", encoding="utf-8") as f:
         f.write("\n".join(concepts))
 
-    if args.fusion_mode in {"concat", "gated", "learnable_gated"}:
+    if args.fusion_mode in {"concat", "gated", "learnable_gated", "multiply"}:
         if args.global_pose_dir is None or args.global_backbone_train is None or args.global_backbone_val is None:
             raise ValueError(
                 f"--fusion-mode {args.fusion_mode} requires --global-pose-dir, --global-backbone-train, and --global-backbone-val."
@@ -698,6 +715,14 @@ def main() -> None:
                     f,
                     indent=2,
                 )
+        elif args.fusion_mode == "multiply":
+            # Element-wise product: local concept scores * global concept scores
+            fused_train = train_local_norm * train_global_norm
+            fused_val = val_local_norm * val_global_norm
+            with open(save_dir / "fused_concepts.txt", "w", encoding="utf-8") as f:
+                f.write("\n".join(global_concepts))
+            with open(save_dir / "fusion_config.json", "w", encoding="utf-8") as f:
+                json.dump({"fusion_mode": "multiply"}, f, indent=2)
         else:
             fused_train, fused_val, gate = train_learnable_gate(
                 args=args,
