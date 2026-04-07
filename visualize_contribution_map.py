@@ -1,10 +1,8 @@
-"""Visualize contribution maps for Per-Concept Attention CBM.
+"""Visualize contribution maps for Per-Concept Attention CBM (paper figure).
 
-For each test sample, produces side-by-side comparisons of:
-  1. Original video frames
-  2. Localizer heatmap (raw concept logits)
-  3. Attention map (softmax of logits)
-  4. Contribution map (attn × W_c relevance)
+For each test sample, produces a single unified figure with:
+  (a) Horizontal bar chart of per-concept contributions to the predicted class
+  (b) Spatial contribution maps for top-K concepts at peak timesteps
 
 Only the top-K concepts (by W_g weight for the predicted class) are shown.
 """
@@ -14,10 +12,14 @@ import argparse
 import json
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 import numpy as np
+from PIL import Image, ImageDraw
 import torch
 import torch.nn.functional as F
-from PIL import Image
 from tqdm.auto import tqdm
 
 from configs.defaults import build_videomae_args
@@ -72,10 +74,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attention-temperature", type=float, default=5.0)
     parser.add_argument("--topk-concepts", type=int, default=5,
                         help="Show top-K concepts by W_g weight for predicted class")
+    parser.add_argument("--peak-timesteps", type=int, default=2,
+                        help="Number of peak timesteps to show per concept")
     parser.add_argument("--max-samples", type=int, default=10)
     parser.add_argument("--class-names", type=Path, default=None,
                         help="Path to class_list.txt")
     parser.add_argument("--alpha", type=float, default=0.5, help="Heatmap overlay opacity")
+    parser.add_argument("--concept-canvas-dir", type=Path, default=None,
+                        help="Directory with concept_NNN_canvas.png trajectory visualizations. "
+                             "If provided, trajectory patterns are overlaid on contribution maps.")
+    parser.add_argument("--canvas-alpha", type=float, default=0.6,
+                        help="Opacity for trajectory canvas overlay on contribution maps")
+    parser.add_argument("--trajectory-data", type=Path, default=None,
+                        help="Path to trajectories.npy [num_concepts, L, 2] displacement vectors. "
+                             "If provided, arrow-shaped trajectories are rendered on contribution maps.")
+    parser.add_argument("--trajectory-scale", type=float, default=3.0,
+                        help="Scale factor for trajectory displacements when rendering arrows.")
+    parser.add_argument("--arrow-line-width", type=int, default=4,
+                        help="Line width for arrow-shaped trajectory rendering.")
+    parser.add_argument("--arrow-size", type=float, default=12.0,
+                        help="Arrowhead size for trajectory rendering.")
     parser.set_defaults(use_checkpoint=False, use_mean_pooling=True)
     return parser.parse_args()
 
@@ -137,6 +155,206 @@ def _overlay_heatmap(frame: np.ndarray, heatmap: np.ndarray, alpha: float) -> np
     return blended.clip(0, 255).astype(np.uint8)
 
 
+def _load_concept_canvas(canvas_dir: Path, concept_idx: int, size: int) -> np.ndarray | None:
+    """Load concept_NNN_canvas.png, resize to (size, size), return [H,W,3] uint8 or None."""
+    path = canvas_dir / f"concept_{concept_idx:03d}_canvas.png"
+    if not path.exists():
+        return None
+    img = Image.open(path).convert("RGB").resize((size, size), Image.LANCZOS)
+    return np.array(img)
+
+
+def _overlay_canvas(
+    base: np.ndarray,
+    canvas: np.ndarray,
+    alpha: float,
+    contrib_map: np.ndarray,
+) -> np.ndarray:
+    """Overlay trajectory canvas centered on the contribution map's peak activation.
+
+    1. Find the centroid of the canvas trajectory (non-black pixels).
+    2. Find the centroid of the peak activation region in the contribution map.
+    3. Translate the canvas so the trajectory centroid aligns with the activation centroid.
+    4. Blend only non-black canvas pixels onto the base image.
+    """
+    H, W = base.shape[:2]
+    # Canvas trajectory mask
+    canvas_mask = canvas.max(axis=2) > 15  # [H, W] bool
+
+    if not canvas_mask.any():
+        return base
+
+    # Centroid of canvas trajectory
+    cy_canvas, cx_canvas = np.argwhere(canvas_mask).mean(axis=0)
+
+    # Centroid of peak activation (only positive contributions — where the concept is detected)
+    pos_contrib = np.maximum(contrib_map, 0)  # [H, W]
+    total = pos_contrib.sum()
+    if total < 1e-8:
+        # No meaningful activation — fall back to image center
+        cy_act, cx_act = H / 2.0, W / 2.0
+    else:
+        ys, xs = np.mgrid[:H, :W]
+        cy_act = (ys * pos_contrib).sum() / total
+        cx_act = (xs * pos_contrib).sum() / total
+
+    # Compute translation offset
+    dy = int(round(cy_act - cy_canvas))
+    dx = int(round(cx_act - cx_canvas))
+
+    # Translate canvas and mask
+    shifted_canvas = np.zeros_like(canvas)
+    shifted_mask = np.zeros((H, W), dtype=np.float32)
+
+    # Source and destination slicing
+    src_y0 = max(0, -dy)
+    src_y1 = min(H, H - dy)
+    src_x0 = max(0, -dx)
+    src_x1 = min(W, W - dx)
+    dst_y0 = max(0, dy)
+    dst_y1 = min(H, H + dy)
+    dst_x0 = max(0, dx)
+    dst_x1 = min(W, W + dx)
+
+    h_copy = min(src_y1 - src_y0, dst_y1 - dst_y0)
+    w_copy = min(src_x1 - src_x0, dst_x1 - dst_x0)
+    if h_copy <= 0 or w_copy <= 0:
+        return base
+
+    shifted_canvas[dst_y0:dst_y0 + h_copy, dst_x0:dst_x0 + w_copy] = \
+        canvas[src_y0:src_y0 + h_copy, src_x0:src_x0 + w_copy]
+    shifted_mask[dst_y0:dst_y0 + h_copy, dst_x0:dst_x0 + w_copy] = \
+        canvas_mask[src_y0:src_y0 + h_copy, src_x0:src_x0 + w_copy].astype(np.float32)
+
+    mask3 = shifted_mask[:, :, None]  # [H, W, 1]
+    blended = base.astype(np.float32) * (1 - mask3 * alpha) + shifted_canvas.astype(np.float32) * mask3 * alpha
+    return blended.clip(0, 255).astype(np.uint8)
+
+
+# ---------------------------------------------------------------------------
+# Arrow-shaped trajectory rendering (ported from trajectory labeling script)
+# ---------------------------------------------------------------------------
+
+def _build_cumulative_points(trajectory: np.ndarray) -> np.ndarray:
+    """Convert displacement vectors [L, 2] to cumulative positions [L+1, 2]."""
+    return np.concatenate(
+        [np.zeros((1, 2), dtype=np.float32), np.cumsum(trajectory, axis=0)],
+        axis=0,
+    )
+
+
+def _draw_arrow(
+    draw: ImageDraw.ImageDraw,
+    start: np.ndarray,
+    end: np.ndarray,
+    color: tuple[int, int, int],
+    line_width: int = 4,
+    arrow_size: float = 12.0,
+) -> None:
+    """Draw a line segment with an arrowhead from start to end."""
+    draw.line(
+        [(float(start[0]), float(start[1])), (float(end[0]), float(end[1]))],
+        fill=color,
+        width=line_width,
+    )
+
+    vec = end - start
+    norm = float(np.linalg.norm(vec))
+    if norm < 1e-6:
+        return
+
+    direction = vec / norm
+    perp = np.array([-direction[1], direction[0]], dtype=np.float32)
+    head_len = min(arrow_size, max(norm * 0.6, arrow_size * 0.5))
+    base = end - direction * head_len
+    left = base + perp * (head_len * 0.45)
+    right = base - perp * (head_len * 0.45)
+    draw.polygon(
+        [
+            (float(end[0]), float(end[1])),
+            (float(left[0]), float(left[1])),
+            (float(right[0]), float(right[1])),
+        ],
+        fill=color,
+    )
+
+
+def _overlay_trajectory_arrows(
+    base: np.ndarray,
+    trajectory: np.ndarray,
+    contrib_map: np.ndarray,
+    scale: float = 3.0,
+    line_width: int = 4,
+    arrow_size: float = 12.0,
+) -> np.ndarray:
+    """Render arrow-shaped trajectory on the base image, anchored at peak activation.
+
+    Parameters
+    ----------
+    base : [H, W, 3] uint8 image.
+    trajectory : [L, 2] displacement vectors for this concept.
+    contrib_map : [H, W] float contribution map (used to find anchor point).
+    scale : Scale factor for trajectory displacements.
+    line_width : Arrow shaft width.
+    arrow_size : Arrowhead size.
+
+    Returns
+    -------
+    [H, W, 3] uint8 blended image.
+    """
+    H, W = base.shape[:2]
+
+    # Find anchor at centroid of positive activation
+    pos_contrib = np.maximum(contrib_map, 0)
+    total = pos_contrib.sum()
+    if total < 1e-8:
+        anchor = np.array([W / 2.0, H / 2.0], dtype=np.float32)
+    else:
+        ys, xs = np.mgrid[:H, :W]
+        cy = (ys * pos_contrib).sum() / total
+        cx = (xs * pos_contrib).sum() / total
+        anchor = np.array([cx, cy], dtype=np.float32)
+
+    # Build cumulative trajectory points, scaled and anchored
+    points = _build_cumulative_points(trajectory) * float(scale)
+    # Center the trajectory on the anchor
+    traj_center = points.mean(axis=0)
+    points = points - traj_center + anchor[None, :]
+
+    # Draw arrows on a PIL image
+    img = Image.fromarray(base).convert("RGB")
+    draw = ImageDraw.Draw(img)
+
+    total_steps = len(trajectory)
+    for idx in range(1, total_steps + 1):
+        start = points[idx - 1]
+        end = points[idx]
+        # Color gradient: green-ish at start → red-ish at end
+        ratio = idx / max(total_steps, 1)
+        color = (
+            int(25 + 200 * ratio),
+            int(220 - 90 * ratio),
+            int(70 + 140 * (1.0 - ratio)),
+        )
+        _draw_arrow(draw, start, end, color=color, line_width=line_width, arrow_size=arrow_size)
+
+    # Draw start point marker
+    r = 5
+    draw.ellipse(
+        [
+            float(points[0][0] - r),
+            float(points[0][1] - r),
+            float(points[0][0] + r),
+            float(points[0][1] + r),
+        ],
+        fill=(255, 235, 59),
+        outline=(0, 0, 0),
+        width=1,
+    )
+
+    return np.asarray(img, dtype=np.uint8)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -195,6 +413,17 @@ def main() -> None:
     fc_norm = vmae_model.fc_norm if vmae_model.fc_norm is not None else torch.nn.Identity()
     fc_norm = fc_norm.to(device).eval()
 
+    # Pre-load concept canvas images if available
+    concept_canvases: dict[int, np.ndarray | None] = {}
+    if args.concept_canvas_dir is not None:
+        print(f"Loading concept canvases from {args.concept_canvas_dir}")
+
+    # Load trajectory displacement data if available
+    trajectory_data: np.ndarray | None = None
+    if args.trajectory_data is not None:
+        trajectory_data = np.load(args.trajectory_data).astype(np.float32)
+        print(f"Loaded trajectory data: {trajectory_data.shape} from {args.trajectory_data}")
+
     print(f"W_c: {tuple(w_c.shape)}, W_g: {tuple(w_g.shape)}")
     print(f"Temperature: {args.attention_temperature}")
     print(f"Visualizing up to {args.max_samples} samples, top-{args.topk_concepts} concepts")
@@ -242,8 +471,9 @@ def main() -> None:
         pred_name = class_names[pred_class] if class_names else str(pred_class)
         gt_name = class_names[label] if class_names else str(label)
 
-        # --- Select top-K concepts by concept score magnitude ---
-        topk_indices = concept_scores.abs().argsort(descending=True)[:args.topk_concepts].tolist()
+        # --- Select top-K concepts by class-level contribution to the predicted class ---
+        class_contrib = concept_scores * w_g[pred_class]
+        topk_indices = class_contrib.argsort(descending=True)[:args.topk_concepts].tolist()
 
         # --- Compute per-position relevance and contribution maps ---
         # relevance[c, t, h, w] = W_c[c] · backbone[t, h, w]
@@ -260,7 +490,7 @@ def main() -> None:
         # contribution[c, t, h, w] = attn[c, t, h, w] × relevance[c, t, h, w]
         contribution = attn_spatial[0].cpu() * relevance  # [C, T, H, W]
 
-        # --- Build visualization for each top concept ---
+        # --- Build unified paper figure ---
         sample_dir = output_dir / sample_id.replace("/", "__")
         sample_dir.mkdir(parents=True, exist_ok=True)
 
@@ -273,79 +503,129 @@ def main() -> None:
                 "pred_class": pred_class,
                 "pred_name": pred_name,
                 "concept_scores": concept_scores.tolist(),
+                "class_contributions": class_contrib.tolist(),
                 "topk_concepts": topk_indices,
                 "wg_weights": {str(c): float(w_g[pred_class, c]) for c in topk_indices},
             }, f, indent=2)
 
-        # Original frames (from input video tensor, tubelet_size=2 so T_grid = T_frames/2)
-        # video: [C, T_frames, H_input, W_input]
         input_size = args.input_size
+        K = len(topk_indices)
+        n_peak = args.peak_timesteps
 
+        # Global contribution scale (95th percentile across all concepts)
+        p95 = torch.quantile(contribution.abs().float(), 0.95) if contribution.abs().max() > 0 else 1.0
+        p95 = max(float(p95), 1e-8)
+
+        # Pre-compute per-concept data: peak timesteps + upsampled maps
+        concept_vis_data = []
         for concept_idx in topk_indices:
-            wg_weight = w_g[pred_class, concept_idx].item()
-            c_score = concept_scores[concept_idx].item()
+            contrib_map = contribution[concept_idx]  # [T, H_grid, W_grid]
+            # Pick peak timesteps by total absolute contribution
+            temporal_strength = contrib_map.abs().sum(dim=(1, 2))  # [T]
+            peak_ts = temporal_strength.argsort(descending=True)[:n_peak].sort().values.tolist()
 
-            # Get spatial maps for this concept
-            logit_map = concept_logits[0, concept_idx].cpu()       # [T, H_grid, W_grid]
-            attn_map = attn_spatial[0, concept_idx].cpu()           # [T, H_grid, W_grid]
-            contrib_map = contribution[concept_idx]                  # [T, H_grid, W_grid]
+            contrib_vis = (contrib_map / p95).clamp(-1, 1)
+            contrib_up = _upsample_map(contrib_vis, input_size)  # [T, 224, 224]
 
-            # Absolute scale: no per-map normalization
-            # Localizer: sigmoid output, already in [0, 1]
-            logit_vis = torch.sigmoid(logit_map).clamp(0, 1)
-            # Attention: softmax output, scale relative to uniform baseline
-            # uniform = 1/S; values >> 1/S are "high attention"
-            # Multiply by S so uniform = 1.0, then clamp to [0, 3] and divide by 3
-            uniform_val = 1.0 / S
-            attn_vis = (attn_map / uniform_val).clamp(0, 3) / 3.0
-            # Contribution: keep sign, scale by 95th percentile of abs values
-            # Positive = supports concept, Negative = suppresses concept
-            p95 = torch.quantile(contribution.abs().float(), 0.95) if contribution.abs().max() > 0 else 1.0
-            contrib_vis = (contrib_map / max(float(p95), 1e-8)).clamp(-1, 1)  # [-1, 1]
+            concept_vis_data.append({
+                "concept_idx": concept_idx,
+                "peak_ts": peak_ts,
+                "contrib_up": contrib_up,
+                "wg_weight": w_g[pred_class, concept_idx].item(),
+                "c_score": concept_scores[concept_idx].item(),
+                "c_contrib": class_contrib[concept_idx].item(),
+            })
 
-            # Upsample to input resolution
-            logit_up = _upsample_map(logit_vis, input_size)    # [T, 224, 224]
-            attn_up = _upsample_map(attn_vis, input_size)      # [T, 224, 224]
-            contrib_up = _upsample_map(contrib_vis, input_size) # [T, 224, 224]
+        # --- Build figure with gridspec ---
+        # Layout: top row = bar chart spanning full width
+        #         bottom rows = K concepts × (n_peak × 2 columns: orig + contrib)
+        fig = plt.figure(figsize=(3.0 * n_peak * 2, 2.5 + 2.5 * K), dpi=150)
+        gs = gridspec.GridSpec(
+            K + 1, n_peak * 2,
+            figure=fig,
+            height_ratios=[1.2] + [1.0] * K,
+            hspace=0.35, wspace=0.08,
+        )
 
-            # Build image grid: each row is one timestep
-            # Columns: original | localizer | attention | contribution
-            rows = []
-            for t in range(T):
-                # Map grid time t back to video frame index
-                # tubelet_size=2, so grid time t corresponds to frame t*2
+        # (a) Bar chart of concept contributions
+        ax_bar = fig.add_subplot(gs[0, :])
+        contribs = [d["c_contrib"] for d in concept_vis_data]
+        labels = [f"C{d['concept_idx']}" for d in concept_vis_data]
+        colors = ["#d73027" if v >= 0 else "#4575b4" for v in contribs]
+        y_pos = np.arange(K)
+        ax_bar.barh(y_pos, contribs, color=colors, edgecolor="k", linewidth=0.5)
+        ax_bar.set_yticks(y_pos)
+        ax_bar.set_yticklabels(labels, fontsize=10)
+        ax_bar.invert_yaxis()
+        ax_bar.set_xlabel("Contribution to predicted class", fontsize=10)
+        ax_bar.axvline(0, color="k", linewidth=0.5)
+        ax_bar.set_title(
+            f"GT: {gt_name}  |  Pred: {pred_name}",
+            fontsize=12, fontweight="bold",
+        )
+        ax_bar.tick_params(labelsize=9)
+
+        # (b) Spatial maps: each row = one concept, columns = peak timesteps × (orig, contrib)
+        import matplotlib.cm as cm
+
+        for row_i, d in enumerate(concept_vis_data):
+            peak_ts = d["peak_ts"]
+            contrib_up = d["contrib_up"]
+            concept_idx = d["concept_idx"]
+
+            # Load canvas for this concept (lazy, cached)
+            if args.concept_canvas_dir is not None and concept_idx not in concept_canvases:
+                concept_canvases[concept_idx] = _load_concept_canvas(
+                    args.concept_canvas_dir, concept_idx, input_size,
+                )
+            canvas = concept_canvases.get(concept_idx)
+
+            for col_j, t in enumerate(peak_ts):
                 frame_idx = min(t * args.tubelet_size, video.shape[1] - 1)
                 frame = _to_uint8_rgb(video[:, frame_idx])  # [H, W, 3]
-
-                logit_hm = _apply_colormap(logit_up[t].numpy())
-                attn_hm = _apply_colormap(attn_up[t].numpy())
                 contrib_hm = _apply_diverging_colormap(contrib_up[t].numpy())
+                overlay = _overlay_heatmap(frame, contrib_hm, args.alpha)
+                # Overlay arrow-shaped trajectory if trajectory data is available
+                if trajectory_data is not None and concept_idx < trajectory_data.shape[0]:
+                    overlay = _overlay_trajectory_arrows(
+                        overlay,
+                        trajectory_data[concept_idx],
+                        contrib_up[t].numpy(),
+                        scale=args.trajectory_scale,
+                        line_width=args.arrow_line_width,
+                        arrow_size=args.arrow_size,
+                    )
+                # Fall back to canvas overlay if no trajectory data
+                elif canvas is not None:
+                    overlay = _overlay_canvas(
+                        overlay, canvas, args.canvas_alpha,
+                        contrib_up[t].numpy(),
+                    )
 
-                col_orig = frame
-                col_logit = _overlay_heatmap(frame, logit_hm, args.alpha)
-                col_attn = _overlay_heatmap(frame, attn_hm, args.alpha)
-                col_contrib = _overlay_heatmap(frame, contrib_hm, args.alpha)
+                # Original frame
+                ax_orig = fig.add_subplot(gs[row_i + 1, col_j * 2])
+                ax_orig.imshow(frame)
+                ax_orig.set_xticks([])
+                ax_orig.set_yticks([])
+                if col_j == 0:
+                    ax_orig.set_ylabel(
+                        f"C{concept_idx}\n({d['c_contrib']:+.2f})",
+                        fontsize=9, rotation=0, labelpad=40, va="center",
+                    )
+                if row_i == 0:
+                    ax_orig.set_title(f"t={t} orig", fontsize=8)
 
-                row = np.concatenate([col_orig, col_logit, col_attn, col_contrib], axis=1)
-                rows.append(row)
+                # Contribution overlay
+                ax_cont = fig.add_subplot(gs[row_i + 1, col_j * 2 + 1])
+                ax_cont.imshow(overlay)
+                ax_cont.set_xticks([])
+                ax_cont.set_yticks([])
+                if row_i == 0:
+                    ax_cont.set_title(f"t={t} contrib", fontsize=8)
 
-            grid = np.concatenate(rows, axis=0)
-            img = Image.fromarray(grid)
-
-            fname = f"concept{concept_idx:02d}_wg{wg_weight:+.3f}_score{c_score:.3f}.png"
-            img.save(sample_dir / fname)
-
-        # Save a legend image
-        legend_text = (
-            f"Sample: {sample_id}\n"
-            f"GT: {gt_name} | Pred: {pred_name}\n"
-            f"Columns: Original | Localizer (sigmoid) | Attention (softmax) | Contribution\n"
-            f"Top concepts for '{pred_name}':\n"
-        )
-        for c in topk_indices:
-            legend_text += f"  concept {c}: W_g={w_g[pred_class, c]:.3f}, score={concept_scores[c]:.3f}\n"
-        with open(sample_dir / "legend.txt", "w") as f:
-            f.write(legend_text)
+        fig.savefig(sample_dir / "paper_figure.png", bbox_inches="tight", pad_inches=0.1)
+        fig.savefig(sample_dir / "paper_figure.pdf", bbox_inches="tight", pad_inches=0.1)
+        plt.close(fig)
 
     print(f"Saved visualizations to {output_dir}")
 

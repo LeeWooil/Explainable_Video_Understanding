@@ -214,6 +214,7 @@ class LocalConceptVideoDataset(LocalVideoDataset):
         input_size: int = 224,
         deterministic: bool = True,
         view_mode: str = "random",
+        predownsampled: bool = False,
     ) -> None:
         super().__init__(
             anno_path=anno_path,
@@ -229,6 +230,7 @@ class LocalConceptVideoDataset(LocalVideoDataset):
         self.tubelet_size = int(tubelet_size)
         self.patch_size = int(patch_size)
         self.target_cache_root = Path(target_cache_root) if target_cache_root is not None else None
+        self.predownsampled = bool(predownsampled)
 
     def _target_cache_path(self, meta: dict[str, Any]) -> Path | None:
         if self.target_cache_root is None:
@@ -244,21 +246,33 @@ class LocalConceptVideoDataset(LocalVideoDataset):
         digest = hashlib.sha1(json.dumps(key_payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
         return self.target_cache_root / meta["sample_id"] / f"{digest}.pt"
 
+    def _load_predownsampled(self, sample_id: str) -> torch.Tensor:
+        """Load a mask that was already downsampled by build_pseudo_labels.py."""
+        mask_path = self.pseudo_mask_root / sample_id / "pixel_mask.npy"
+        mask = np.load(mask_path)
+        target = torch.from_numpy(mask).float()
+        if target.ndim == 3:
+            target = target.unsqueeze(0)
+        return target
+
     def __getitem__(self, index: int) -> tuple[torch.Tensor, int, torch.Tensor, dict[str, Any]]:
         video, label, meta = super().__getitem__(index)
-        cache_path = self._target_cache_path(meta)
-        if cache_path is not None and cache_path.exists():
-            target = torch.load(cache_path, map_location="cpu", weights_only=True)
+        if self.predownsampled:
+            target = self._load_predownsampled(meta["sample_id"])
         else:
-            target = build_target_from_meta(
-                meta=meta,
-                mask_root=self.pseudo_mask_root,
-                tubelet_size=self.tubelet_size,
-                input_size=self.input_size,
-                patch_size=self.patch_size,
-            )
-            if cache_path is not None:
-                cache_path.parent.mkdir(parents=True, exist_ok=True)
-                torch.save(target.contiguous().to(dtype=torch.uint8), cache_path)
+            cache_path = self._target_cache_path(meta)
+            if cache_path is not None and cache_path.exists():
+                target = torch.load(cache_path, map_location="cpu", weights_only=True)
+            else:
+                target = build_target_from_meta(
+                    meta=meta,
+                    mask_root=self.pseudo_mask_root,
+                    tubelet_size=self.tubelet_size,
+                    input_size=self.input_size,
+                    patch_size=self.patch_size,
+                )
+                if cache_path is not None:
+                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    torch.save(target.contiguous().to(dtype=torch.uint8), cache_path)
         target = target.to(dtype=torch.float32)
         return video, label, target, meta

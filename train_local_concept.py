@@ -98,6 +98,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-cache-root", type=Path, default=None)
     parser.add_argument("--precompute-target-cache", action="store_true")
     parser.add_argument("--precompute-target-cache-only", action="store_true")
+    parser.add_argument("--predownsampled", action="store_true",
+                        help="Pseudo masks are already downsampled to [C,T',H',W'] by build_pseudo_labels.py. "
+                             "Skip frame selection, crop, resize, and pooling at load time.")
     parser.add_argument("--use-pos-weight", action="store_true")
     parser.add_argument("--pos-weight-max", type=float, default=10.0)
     parser.add_argument("--pos-weight-eps", type=float, default=1e-6)
@@ -135,6 +138,7 @@ def _build_dataset(
         input_size=cli_args.input_size,
         deterministic=cli_args.deterministic_spatial,
         view_mode=cli_args.view_mode,
+        predownsampled=cli_args.predownsampled,
     )
 
 
