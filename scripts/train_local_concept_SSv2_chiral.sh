@@ -6,16 +6,27 @@
 #SBATCH -p batch_vll
 #SBATCH -w vll4
 #SBATCH -t 4-00:00:00
-#SBATCH -o log/%A-%x.out
-#SBATCH -e log/%A-%x.err
+#SBATCH -o /data/lwi2765/repos/XAI/Video_Language_XAI/CBM_training_ver2/log/%A-%x.out
+#SBATCH -e /data/lwi2765/repos/XAI/Video_Language_XAI/CBM_training_ver2/log/%A-%x.err
 
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
-PYTHON_SCRIPT="${REPO_ROOT}/train_local_concept.py"
+source /data/lwi2765/repos/XAI/Video_Language_XAI/CBM_training_ver2/scripts/slack_notify.sh
+slack_start
+
+
+source /data/lwi2765/anaconda3/etc/profile.d/conda.sh
+conda activate DANCE
+
+echo "Using python: $(which python)"
+python --version
+echo "Using torchrun: $(which torchrun)"
+echo "Using pip: $(which pip)"
+python -m pip show tqdm | sed -n '1,20p'
+
+PYTHON_SCRIPT="/data/lwi2765/repos/XAI/Video_Language_XAI/CBM_training_ver2/train_local_concept.py"
 NUM_GPUS=${SLURM_GPUS_ON_NODE:-8}
-TARGET_CACHE_ROOT="${REPO_ROOT}/cache/local_concept_targets_ssv2_chiral"
+TARGET_CACHE_ROOT="/data/dataset/VideoXAI/pseudo_mask/ssv2_chirality/cache"
 
-torchrun \
+python -m torch.distributed.run \
     --standalone \
     --nproc_per_node=${NUM_GPUS} \
     $PYTHON_SCRIPT \
@@ -27,12 +38,12 @@ torchrun \
     --finetune /data/lwi2765/repos/VideoMAE/videoMAE/videomae_weight/ssv2_finetune_800.pth \
     --data-set SSv2_chiral \
     --nb-classes 32 \
-    --batch-size 8 \
+    --batch-size 32 \
     --epochs 20 \
     --lr 5e-3 \
-    --num-workers 8 \
+    --num-workers 2 \
     --device cuda \
-    --block-index 6 \
+    --block-index 11 \
     --num-frames 16 \
     --num-segments 1 \
     --sampling-rate 4 \
@@ -45,10 +56,10 @@ torchrun \
     --view-mode center_uniform \
     --target-cache-root ${TARGET_CACHE_ROOT} \
     --precompute-target-cache \
-    --output-dir ${REPO_ROOT}/runs/SSv2_chiral \
+    --output-dir /data/lwi2765/repos/XAI/Video_Language_XAI/CBM_training_ver2/runs/SSv2_chiral/SSv2_block_11 \
     --save-preview-every 5 \
     --preview-max-samples 4
-
+slack_end $?
 # If you want cache generation only:
 #    replace `--precompute-target-cache` with `--precompute-target-cache-only`
 #

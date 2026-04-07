@@ -48,9 +48,10 @@ class ConceptAwareSpatialPool(nn.Module):
         pooled:         [B, D]            (concept-aware global feature)
     """
 
-    def __init__(self, temperature: float = 1.0) -> None:
+    def __init__(self, temperature: float = 1.0, mode: str = "softmax") -> None:
         super().__init__()
         self.temperature = temperature
+        self.mode = mode
 
     def forward(
         self, feature_map: torch.Tensor, concept_logits: torch.Tensor
@@ -59,10 +60,12 @@ class ConceptAwareSpatialPool(nn.Module):
         D = feature_map.shape[1]
         S = T * H * W
 
-        # Per-concept softmax attention over spatial dims
-        attn = torch.softmax(
-            concept_logits.view(B, C, S) / self.temperature, dim=-1
-        )                                                   # [B, C, S]
+        logit_flat = concept_logits.view(B, C, S)
+
+        if self.mode == "sigmoid":
+            attn = torch.sigmoid(logit_flat)                # [B, C, S]
+        else:
+            attn = torch.softmax(logit_flat / self.temperature, dim=-1)  # [B, C, S]
 
         # Merge: max across concepts -> single importance map
         importance, _ = attn.max(dim=1)                     # [B, S]

@@ -180,6 +180,44 @@
         "--max-samples", "15",
         "--save-gt-frames"
       ]
+    },
+    {
+      "name": "CBM v2 | Visualize Contribution Map (KTH, Per-Concept CBM)",
+      "type": "python",
+      "request": "launch",
+      "program": "/data/lwi2765/repos/XAI/Video_Language_XAI/CBM_training_ver2/visualize_contribution_map.py",
+      "cwd": "/data/lwi2765/repos/XAI/Video_Language_XAI/CBM_training_ver2",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "args": [
+        "--anno-path", "/data/lwi2765/repos/XAI/Video_Language_XAI/dataset/KTH/val.csv",
+        "--data-root", "/local_datasets/kth/video",
+        "--data-set", "kth",
+        "--nb-classes", "6",
+        "--num-concepts", "21",
+        "--backbone", "vmae_vit_base_patch16_224",
+        "--finetune", "/data/lwi2765/repos/VideoMAE/videoMAE/result/KTH/OUT/KTH_videomae_finetune.pth",
+        "--block-index", "11",
+        "--num-frames", "16",
+        "--num-segments", "1",
+        "--sampling-rate", "4",
+        "--tubelet-size", "2",
+        "--input-size", "224",
+        "--patch-size", "16",
+        "--deterministic-spatial",
+        "--localizer-ckpt", "/data/lwi2765/repos/XAI/Video_Language_XAI/CBM_training_ver2/runs/block_ablation_aligned/block11/best.pt",
+        "--wc-path", "/data/lwi2765/repos/XAI/Video_Language_XAI/CBM_training_ver2/runs/CBM_result/KTH/perconcept_cbm_aligned/kth_perconcept_cbm_block11_21concepts_temp5.0_04-06_15-45-01/W_c.pt",
+        "--wg-path", "/data/lwi2765/repos/XAI/Video_Language_XAI/CBM_training_ver2/runs/CBM_result/KTH/perconcept_cbm_aligned/kth_perconcept_cbm_block11_21concepts_temp5.0_04-06_15-45-01/W_g.pt",
+        "--bg-path", "/data/lwi2765/repos/XAI/Video_Language_XAI/CBM_training_ver2/runs/CBM_result/KTH/perconcept_cbm_aligned/kth_perconcept_cbm_block11_21concepts_temp5.0_04-06_15-45-01/b_g.pt",
+        "--proj-mean-path", "/data/lwi2765/repos/XAI/Video_Language_XAI/CBM_training_ver2/runs/CBM_result/KTH/perconcept_cbm_aligned/kth_perconcept_cbm_block11_21concepts_temp5.0_04-06_15-45-01/proj_mean.pt",
+        "--proj-std-path", "/data/lwi2765/repos/XAI/Video_Language_XAI/CBM_training_ver2/runs/CBM_result/KTH/perconcept_cbm_aligned/kth_perconcept_cbm_block11_21concepts_temp5.0_04-06_15-45-01/proj_std.pt",
+        "--class-names", "/data/lwi2765/repos/XAI/Video_Language_XAI/dataset/KTH/class_list.txt",
+        "--output-dir", "/data/lwi2765/repos/XAI/Video_Language_XAI/CBM_training_ver2/runs/visualizations/contribution_map_KTH",
+        "--attention-temperature", "5.0",
+        "--topk-concepts", "3",
+        "--max-samples", "20",
+        "--device", "cuda"
+      ]
     }
   ]
 }
