@@ -10,13 +10,10 @@
       "console": "integratedTerminal",
       "justMyCode": false,
       "args": [
-        "--flow-root", "/data/dataset/VideoXAI/optical_flow/ssv2_chiral_flow",
+        "--trajectory-root", "/data/dataset/VideoXAI/optical_flow/ssv2_chiral_trajectory_L16",
+        "--raw-flow-root", "/data/dataset/VideoXAI/optical_flow/ssv2_chiral_flow",
         "--output-root", "/data/lwi2765/repos/XAI/Video_Language_XAI/CBM_training_ver2/output",
-        "--trajectory-length", "16",
-        "--trajectory-stride", "4",
-        "--motion-threshold-percentile", "95",
-        "--saliency-mask-root", "/data/dataset/VideoXAI/saliency_mask/ssv2_chirality",
-        "--saliency-filter-mode", "start_frame",
+        "--global-result-dir", "/data/dataset/VideoXAI/trajectory_per_sample/SSv2_chirality/global_0.95/global_partition_partition8_154clusters_03-24_17-45-14",
         "--limit", "10"
       ]
     },
@@ -33,7 +30,6 @@
         "--raw-flow-root", "/data/dataset/VideoXAI/optical_flow/kth_flow_raw",
         "--output-root", "/data/dataset/VideoXAI/optical_flow/kth_flow_21",
         "--global-result-dir", "/data/dataset/VideoXAI/trajectory_per_sample/kth/kth_global/global_partition_21clusters_03-19_21-17-10",
-        "--trajectory-start-mode", "segment",
         "--limit", "10"
       ]
     },
@@ -212,11 +208,48 @@
         "--proj-mean-path", "/data/lwi2765/repos/XAI/Video_Language_XAI/CBM_training_ver2/runs/CBM_result/KTH/perconcept_cbm_aligned/kth_perconcept_cbm_block11_21concepts_temp5.0_04-06_15-45-01/proj_mean.pt",
         "--proj-std-path", "/data/lwi2765/repos/XAI/Video_Language_XAI/CBM_training_ver2/runs/CBM_result/KTH/perconcept_cbm_aligned/kth_perconcept_cbm_block11_21concepts_temp5.0_04-06_15-45-01/proj_std.pt",
         "--class-names", "/data/lwi2765/repos/XAI/Video_Language_XAI/dataset/KTH/class_list.txt",
-        "--output-dir", "/data/lwi2765/repos/XAI/Video_Language_XAI/CBM_training_ver2/runs/visualizations/contribution_map_KTH",
+        "--output-dir", "/data/lwi2765/repos/XAI/Video_Language_XAI/CBM_training_ver2/runs/visualizations/contribution_map_overlay_arrow_ver__new_KTH",
         "--attention-temperature", "5.0",
         "--topk-concepts", "3",
         "--max-samples", "20",
-        "--device", "cuda"
+        "--device", "cuda",
+        "--concept-canvas-dir", "/data/lwi2765/repos/XAI/Video_Language_XAI/Concept_exraction/Trajectory_based_method/result/KTH_global_0.95/global_labels_vis_21concepts_03-19_21-47-01/trajectory_canvas_visualizations",
+        "--trajectory-data", "/data/lwi2765/repos/XAI/Video_Language_XAI/Concept_exraction/Trajectory_based_method/result/KTH_global_0.95/global_labels_vis_21concepts_03-19_21-47-01/trajectories.npy",
+        "--trajectory-scale", "5.0",
+        "--arrow-line-width", "4",
+        "--arrow-size", "12.0"
+      ]
+    },
+    {
+      "name": "CBM v2 | Extract Localizer Features (KTH, block11, 21 concepts)",
+      "type": "python",
+      "request": "launch",
+      "program": "/data/lwi2765/repos/XAI/Video_Language_XAI/CBM_training_ver2/extract_localizer_features.py",
+      "cwd": "/data/lwi2765/repos/XAI/Video_Language_XAI",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "args": [
+        "--anno-path", "/data/lwi2765/repos/XAI/Video_Language_XAI/dataset/KTH/train.csv",
+        "--val-anno-path", "/data/lwi2765/repos/XAI/Video_Language_XAI/dataset/KTH/val.csv",
+        "--data-root", "/local_datasets/kth/video",
+        "--backbone", "vmae_vit_base_patch16_224",
+        "--finetune", "/data/lwi2765/repos/VideoMAE/videoMAE/result/KTH/OUT/KTH_videomae_finetune.pth",
+        "--data-set", "kth",
+        "--nb-classes", "6",
+        "--num-concepts", "21",
+        "--block-index", "11",
+        "--num-frames", "16",
+        "--num-segments", "1",
+        "--sampling-rate", "4",
+        "--tubelet-size", "2",
+        "--input-size", "224",
+        "--patch-size", "16",
+        "--deterministic-spatial",
+        "--localizer-ckpt", "/data/lwi2765/repos/XAI/Video_Language_XAI/CBM_training_ver2/runs/block_ablation_aligned/block11/best.pt",
+        "--batch-size", "16",
+        "--num-workers", "4",
+        "--device", "cuda",
+        "--output-dir", "/data/lwi2765/repos/XAI/Video_Language_XAI/CBM_training_ver2/runs/cached_features/KTH_block11_21concepts"
       ]
     }
   ]

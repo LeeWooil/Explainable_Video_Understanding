@@ -10,6 +10,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
+import torch
 from tqdm.auto import tqdm
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -17,58 +18,252 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from utils.trajectory_ops import (
-    build_motion_filter_info,
     build_grouped_pixel_masks,
-    build_trajectory_stacks,
-    compute_segment_start_frames,
-    compute_path_lengths_from_stacks,
     flat_indices_to_coords,
-    load_saliency_mask,
     load_trajectory_array,
+)
+from utils.pseudo_labels import (
+    select_mask_by_frame_indices,
+    apply_spatial_transform_to_mask,
+    spatial_pool_to_patches,
+    pool_mask_to_tubelets,
 )
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser("Build absolute-time VideoMAE pseudo labels from flow trajectories.")
-    input_group = parser.add_mutually_exclusive_group(required=True)
-    input_group.add_argument("--flow-root", type=Path)
-    input_group.add_argument("--trajectory-root", type=Path)
+    parser = argparse.ArgumentParser("Build absolute-time VideoMAE pseudo labels from global clustering results.")
+    parser.add_argument("--trajectory-root", type=Path, required=True)
     parser.add_argument(
         "--global-result-dir",
         type=Path,
-        default=None,
-        help="Optional global clustering result directory containing selected_sample_ids/selected_trajectory_indices/cluster_labels.",
+        required=True,
+        help="Global clustering result directory containing selected_sample_ids/selected_trajectory_indices/cluster_labels.",
     )
     parser.add_argument("--output-root", type=Path, required=True)
-    parser.add_argument("--trajectory-length", type=int, default=16)
-    parser.add_argument("--trajectory-stride", type=int, default=4)
-    parser.add_argument("--trajectory-start-mode", type=str, default="sliding", choices=("sliding", "segment"))
     parser.add_argument(
         "--raw-flow-root",
         type=Path,
         default=None,
-        help="Optional raw-flow root used to infer num_flow_frames when --trajectory-root is used.",
-    )
-    parser.add_argument("--motion-threshold", type=float, default=None)
-    parser.add_argument("--motion-threshold-percentile", type=float, default=None)
-    parser.add_argument("--saliency-mask-root", type=Path, default=None)
-    parser.add_argument("--saliency-filter-mode", type=str, default=None, choices=("start_frame",))
-    parser.add_argument(
-        "--concept-map-path",
-        type=Path,
-        default=None,
-        help="Optional sequence_cluster_map.json mapping sample_id[trajectory=<flat_idx>] to global concept id.",
+        help="Optional raw-flow root used to infer num_flow_frames when trajectory files lack that info.",
     )
     parser.add_argument("--num-workers", type=int, default=1)
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--save-trajectory-cache", action="store_true")
-    args = parser.parse_args()
-    if args.global_result_dir is not None and args.trajectory_root is None:
-        raise ValueError("--global-result-dir requires --trajectory-root.")
-    if args.global_result_dir is not None and args.concept_map_path is not None:
-        raise ValueError("Use either --global-result-dir or --concept-map-path, not both.")
-    return args
 
+    # --- Downsampling: replicate training-time spatial/temporal pooling ---
+    parser.add_argument(
+        "--patch-size",
+        type=int,
+        default=None,
+        help="Spatial max-pool stride (e.g. 16). Matches spatial_pool_to_patches at training time.",
+    )
+    parser.add_argument(
+        "--tubelet-size",
+        type=int,
+        default=None,
+        help="Temporal max-pool stride (e.g. 2). Matches pool_mask_to_tubelets at training time.",
+    )
+    # Video access args (required when --patch-size / --tubelet-size is set)
+    parser.add_argument(
+        "--anno-path",
+        type=Path,
+        nargs="+",
+        default=None,
+        help="Annotation CSV(s) mapping video paths to labels (same format as training).",
+    )
+    parser.add_argument("--data-root", type=Path, default=None, help="Root directory for video files.")
+    parser.add_argument("--data-set", type=str, default=None, help="Dataset name (e.g. SSv2_chiral, kth).")
+    parser.add_argument("--num-frames", type=int, default=16, help="Number of frames to sample.")
+    parser.add_argument("--sampling-rate", type=int, default=4, help="Sampling rate for non-segment datasets.")
+    parser.add_argument("--input-size", type=int, default=224, help="Spatial input size after resize/crop.")
+    parser.add_argument("--short-side-size", type=int, default=224, help="Short side size for center_uniform resize.")
+    return parser.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Training-equivalent downsampling
+# ---------------------------------------------------------------------------
+
+def _build_sample_id(sample: str) -> str:
+    """Same logic as local_video_dataset._build_sample_id."""
+    return Path(sample).with_suffix("").as_posix()
+
+
+def _load_annotation_samples(anno_paths: list[Path]) -> dict[str, str]:
+    """Load annotation CSVs and return {sample_id: relative_video_path}."""
+    result: dict[str, str] = {}
+    for path in anno_paths:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(",", 1)
+                sample = parts[0].strip()
+                result[_build_sample_id(sample)] = sample
+    return result
+
+
+def _precompute_video_metadata(
+    sample_ids: list[str],
+    anno_samples: dict[str, str],
+    data_root: Path,
+) -> dict[str, tuple[int, int, int]]:
+    """Return {sample_id: (total_frames, height, width)} for each sample."""
+    from decord import VideoReader, cpu as decord_cpu
+
+    metadata: dict[str, tuple[int, int, int]] = {}
+    missing: list[str] = []
+
+    for sid in tqdm(sample_ids, desc="Reading video metadata", unit="video", file=sys.stdout):
+        if sid not in anno_samples:
+            missing.append(sid)
+            continue
+        sample = anno_samples[sid]
+        video_path = Path(sample)
+        if not video_path.is_absolute():
+            video_path = data_root / sample
+        if not video_path.exists():
+            missing.append(sid)
+            continue
+        try:
+            vr = VideoReader(str(video_path), num_threads=1, ctx=decord_cpu(0))
+            total_frames = len(vr)
+            frame0 = vr[0].asnumpy()
+            h, w = frame0.shape[0], frame0.shape[1]
+            metadata[sid] = (total_frames, h, w)
+            del vr
+        except Exception as e:
+            print(f"[warn] Failed to read video for {sid}: {e}", flush=True)
+            missing.append(sid)
+
+    if missing:
+        print(
+            f"[warn] Could not get video metadata for {len(missing)} / {len(sample_ids)} samples.",
+            flush=True,
+        )
+    return metadata
+
+
+def _compute_deterministic_frame_indices(
+    total_video_frames: int,
+    num_frames: int,
+    sampling_rate: int,
+    data_set: str,
+) -> list[int]:
+    """Replicate LocalVideoDataset._load_video_with_indices (deterministic / center_uniform)."""
+    _segment_datasets = {
+        "ssv2", "ssv2_5k", "ssv2_chiral", "haa100", "penn", "single_object",
+        "kth", "kth-5", "kth-2", "penn-action",
+    }
+    if data_set.lower() in _segment_datasets:
+        average_duration = total_video_frames // num_frames
+        if average_duration > 0:
+            offsets = np.full(num_frames, average_duration // 2, dtype=np.int64)
+            frame_indices = (
+                np.multiply(list(range(num_frames)), average_duration) + offsets
+            ).astype(np.int64).tolist()
+        elif total_video_frames > num_frames:
+            frame_indices = np.rint(
+                np.linspace(0, total_video_frames - 1, num_frames)
+            ).astype(np.int64).tolist()
+        else:
+            frame_indices = list(range(total_video_frames))
+            while len(frame_indices) < num_frames:
+                frame_indices.append(frame_indices[-1])
+    else:
+        converted_len = num_frames * sampling_rate
+        if total_video_frames <= converted_len:
+            frame_indices = np.rint(
+                np.linspace(0, max(total_video_frames - 1, 0), num_frames)
+            ).astype(np.int64).tolist()
+        else:
+            start_idx = max(0, (total_video_frames - converted_len) // 2)
+            end_idx = start_idx + converted_len
+            frame_indices = np.rint(
+                np.linspace(start_idx, end_idx - 1, num_frames)
+            ).astype(np.int64).tolist()
+    return frame_indices
+
+
+def _compute_center_crop_params(
+    video_h: int,
+    video_w: int,
+    short_side_size: int,
+    input_size: int,
+) -> tuple[int, int, int, int]:
+    """Replicate LocalVideoDataset._transform_frames center_uniform crop logic."""
+    h, w = video_h, video_w
+    if (w <= h and w == short_side_size) or (h <= w and h == short_side_size):
+        new_h, new_w = h, w
+    elif w < h:
+        new_w = short_side_size
+        new_h = int(short_side_size * h / w)
+    else:
+        new_h = short_side_size
+        new_w = int(short_side_size * w / h)
+    crop_h = crop_w = input_size
+    top = max((new_h - crop_h) // 2, 0)
+    left = max((new_w - crop_w) // 2, 0)
+    return (top, left, crop_h, crop_w)
+
+
+def _downsample_mask_like_training(
+    mask: np.ndarray,
+    total_video_frames: int,
+    video_h: int,
+    video_w: int,
+    data_set: str,
+    num_frames: int,
+    sampling_rate: int,
+    short_side_size: int,
+    input_size: int,
+    patch_size: int,
+    tubelet_size: int,
+) -> np.ndarray:
+    """Apply the exact same pipeline as build_target_from_meta at training time.
+
+    Pipeline (matches pseudo_labels.py + local_video_dataset.py center_uniform):
+      1. select_mask_by_frame_indices  — deterministic segment-based sampling
+      2. spatial crop                  — center_uniform crop params
+      3. apply_spatial_transform       — nearest-resize to (input_size, input_size)
+      4. spatial_pool_to_patches       — max_pool2d(kernel=patch_size)
+      5. pool_mask_to_tubelets         — temporal max-pool(tubelet_size)
+    """
+    # 1. Frame selection (deterministic / center_uniform)
+    frame_indices = _compute_deterministic_frame_indices(
+        total_video_frames, num_frames, sampling_rate, data_set,
+    )
+    selected = select_mask_by_frame_indices(mask, frame_indices)
+
+    # 2. Spatial crop (center_uniform)
+    crop_params = _compute_center_crop_params(video_h, video_w, short_side_size, input_size)
+    top, left, crop_h, crop_w = crop_params
+    if selected.ndim == 3:
+        cropped = selected[:, top : top + crop_h, left : left + crop_w]
+    else:
+        cropped = selected[:, :, top : top + crop_h, left : left + crop_w]
+
+    t = torch.from_numpy(np.array(cropped, copy=True)).float()
+
+    # 3. Resize to input_size (nearest interpolation)
+    resized = apply_spatial_transform_to_mask(
+        t, crop_params=(0, 0, t.shape[-2], t.shape[-1]), input_size=input_size,
+    )
+
+    # 4. Spatial pool to patches
+    patch_mask = spatial_pool_to_patches(resized, patch_size=patch_size)
+
+    # 5. Temporal pool to tubelets
+    pooled = pool_mask_to_tubelets(patch_mask, tubelet_size=tubelet_size)
+    if pooled.ndim == 3:
+        pooled = pooled.unsqueeze(0)
+
+    return pooled.numpy().astype(np.uint8)
+
+
+# ---------------------------------------------------------------------------
+# Coverage stats & global result loading (unchanged)
+# ---------------------------------------------------------------------------
 
 def _compute_coverage_stats(mask: np.ndarray) -> dict:
     if mask.ndim == 4:
@@ -90,16 +285,6 @@ def _compute_coverage_stats(mask: np.ndarray) -> dict:
         "mean_active_patches": float(active_per_frame.mean()) if len(active_per_frame) else 0.0,
         "max_active_patches": int(active_per_frame.max()) if len(active_per_frame) else 0,
     }
-
-
-def load_concept_map(concept_map_path: Path) -> tuple[dict[str, int], int]:
-    with open(concept_map_path, "r", encoding="utf-8") as f:
-        raw = json.load(f)
-    if not isinstance(raw, dict):
-        raise ValueError(f"Expected concept map JSON object at {concept_map_path}")
-    concept_map = {str(key): int(value) for key, value in raw.items()}
-    num_concepts = max(concept_map.values()) + 1 if concept_map else 0
-    return concept_map, num_concepts
 
 
 def load_global_result(global_result_dir: Path) -> dict[str, object]:
@@ -180,26 +365,11 @@ def load_global_result(global_result_dir: Path) -> dict[str, object]:
     }
 
 
-def _relative_sample_key(flow_root: Path, flow_path: Path) -> str:
-    relative_path = flow_path.relative_to(flow_root)
-    return str(relative_path.with_suffix(""))
-
-
-def _build_sliding_stacks(flow: np.ndarray, length: int, stride: int) -> tuple[np.ndarray, np.ndarray]:
-    full_stacks = build_trajectory_stacks(flow, length=length, num_segments=None)
-    start_frames = np.arange(full_stacks.shape[0], dtype=np.int32)[::stride]
-    return full_stacks[::stride].astype(np.float32), start_frames
-
-
-def _ensure_runtime_caches(args: argparse.Namespace) -> None:
-    if not hasattr(args, "_num_flow_frames_cache"):
-        args._num_flow_frames_cache = {}
-    if not hasattr(args, "_raw_flow_path_cache"):
-        args._raw_flow_path_cache = {}
+def _stable_int(text: str) -> int:
+    return int(hashlib.sha1(text.encode("utf-8")).hexdigest()[:8], 16)
 
 
 def _resolve_raw_flow_path(sample_id: str, args: argparse.Namespace) -> Path:
-    _ensure_runtime_caches(args)
     cached_path = args._raw_flow_path_cache.get(sample_id)
     if cached_path is not None:
         return Path(cached_path)
@@ -207,8 +377,6 @@ def _resolve_raw_flow_path(sample_id: str, args: argparse.Namespace) -> Path:
     candidate_roots = []
     if args.raw_flow_root is not None:
         candidate_roots.append(args.raw_flow_root)
-    if args.flow_root is not None:
-        candidate_roots.append(args.flow_root)
 
     for root in candidate_roots:
         candidate = root / f"{sample_id}.npy"
@@ -233,12 +401,11 @@ def _resolve_raw_flow_path(sample_id: str, args: argparse.Namespace) -> Path:
 
     raise FileNotFoundError(
         f"Could not infer num_flow_frames for sample_id={sample_id}. "
-        "Provide --raw-flow-root or --flow-root that contains the matching raw flow."
+        "Provide --raw-flow-root that contains the matching raw flow."
     )
 
 
 def _infer_num_flow_frames(sample_id: str, args: argparse.Namespace) -> int:
-    _ensure_runtime_caches(args)
     cached_value = args._num_flow_frames_cache.get(sample_id)
     if cached_value is not None:
         return int(cached_value)
@@ -247,106 +414,6 @@ def _infer_num_flow_frames(sample_id: str, args: argparse.Namespace) -> int:
     num_flow_frames = int(flow.shape[0])
     args._num_flow_frames_cache[sample_id] = num_flow_frames
     return num_flow_frames
-
-
-def _load_input_stacks(input_path: Path, args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, int]:
-    if args.flow_root is not None:
-        flow = np.load(input_path).astype(np.float32)
-        stacks, start_frames = _build_sliding_stacks(
-            flow=flow,
-            length=args.trajectory_length,
-            stride=args.trajectory_stride,
-        )
-        return stacks, start_frames, int(flow.shape[0])
-
-    trajectory_stacks = load_trajectory_array(input_path)
-    sample_id = _relative_sample_key(args.trajectory_root, input_path)
-    num_flow_frames = _infer_num_flow_frames(sample_id, args)
-    start_frames = compute_segment_start_frames(
-        num_segments=trajectory_stacks.shape[0],
-        trajectory_length=trajectory_stacks.shape[1],
-        trajectory_start_mode=args.trajectory_start_mode,
-        num_flow_frames=num_flow_frames,
-    ).astype(np.int32)
-    return trajectory_stacks, start_frames, num_flow_frames
-
-
-def _filter_trajectory_stacks(
-    trajectory_stacks: np.ndarray,
-    start_frames: np.ndarray,
-    sample_id: str,
-    saliency_sample_id: str,
-    args: argparse.Namespace,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
-    num_segments, _, height, width, _ = trajectory_stacks.shape
-    total_trajectories = num_segments * height * width
-    selected_mask = np.ones((num_segments, height, width), dtype=bool)
-    extra_info: dict = {
-        "trajectory_start_mode": "sliding",
-        "num_flow_frames": int(args.num_flow_frames),
-    }
-
-    if args.saliency_filter_mode == "start_frame":
-        saliency_selected_mask = np.zeros_like(selected_mask)
-        for frame_idx in np.unique(start_frames).tolist():
-            mask = load_saliency_mask(
-                args.saliency_mask_root,
-                saliency_sample_id,
-                int(frame_idx),
-                expected_hw=(height, width),
-            )
-            segment_ids = np.flatnonzero(start_frames == frame_idx)
-            if len(segment_ids) > 0:
-                saliency_selected_mask[segment_ids] = mask[None, :, :] == 1
-        if not np.any(saliency_selected_mask):
-            raise RuntimeError(f"Saliency filtering removed all trajectories for sample_id={sample_id}.")
-        selected_mask &= saliency_selected_mask
-        extra_info.update(
-            {
-                "saliency_mask_root": str(args.saliency_mask_root),
-                "saliency_filter_mode": "start_frame",
-                "num_selected_after_saliency": int(np.sum(saliency_selected_mask)),
-                "num_filtered_out_by_saliency": int(total_trajectories - np.sum(saliency_selected_mask)),
-            }
-        )
-
-    path_lengths = compute_path_lengths_from_stacks(trajectory_stacks).reshape(num_segments, height, width)
-    motion_reference_lengths = path_lengths[selected_mask]
-    motion_selected_subset, motion_info = build_motion_filter_info(
-        path_lengths=motion_reference_lengths,
-        motion_threshold=args.motion_threshold,
-        motion_threshold_percentile=args.motion_threshold_percentile,
-    )
-    motion_selected_mask = np.zeros_like(selected_mask)
-    motion_selected_mask[selected_mask] = motion_selected_subset
-    selected_mask &= motion_selected_mask
-    extra_info.update(motion_info)
-
-    kept_indices = np.flatnonzero(selected_mask.reshape(-1)).astype(np.int32)
-    coords = flat_indices_to_coords(kept_indices, height=height, width=width)
-    kept_start_frames = start_frames[coords[:, 0]]
-    trajectories = np.asarray(
-        trajectory_stacks[coords[:, 0], :, coords[:, 1], coords[:, 2], :],
-        dtype=np.float32,
-    )
-    return trajectories, coords, kept_start_frames, kept_indices, extra_info
-
-
-def _build_concept_labels_for_sample(
-    sample_id: str,
-    kept_indices: np.ndarray,
-    concept_map: dict[str, int],
-) -> np.ndarray:
-    concept_labels = np.full(len(kept_indices), -1, dtype=np.int32)
-    for idx, flat_idx in enumerate(kept_indices.tolist()):
-        key = f"{sample_id}[trajectory={int(flat_idx)}]"
-        if key in concept_map:
-            concept_labels[idx] = int(concept_map[key])
-    return concept_labels
-
-
-def _stable_int(text: str) -> int:
-    return int(hashlib.sha1(text.encode("utf-8")).hexdigest()[:8], 16)
 
 
 def _build_global_sample(
@@ -390,76 +457,6 @@ def _build_global_sample(
     )
 
 
-def process_flow_file(flow_path: Path, args: argparse.Namespace) -> None:
-    trajectory_stacks, start_frames, num_flow_frames = _load_input_stacks(flow_path, args)
-    root = args.flow_root if args.flow_root is not None else args.trajectory_root
-    sample_id = _relative_sample_key(root, flow_path)
-    saliency_sample_id = flow_path.stem
-    if trajectory_stacks.size == 0:
-        return
-
-    args.num_flow_frames = int(num_flow_frames)
-    trajectories, coords, kept_start_frames, kept_indices, extra_info = _filter_trajectory_stacks(
-        trajectory_stacks=trajectory_stacks,
-        start_frames=start_frames,
-        sample_id=sample_id,
-        saliency_sample_id=saliency_sample_id,
-        args=args,
-    )
-    if len(trajectories) == 0:
-        return
-
-    _, _, height, width, _ = trajectory_stacks.shape
-    concept_labels = None
-    labeled_trajectory_count = None
-    if args.concept_map is not None:
-        concept_labels = _build_concept_labels_for_sample(
-            sample_id=sample_id,
-            kept_indices=kept_indices,
-            concept_map=args.concept_map,
-        )
-        labeled_trajectory_count = int(np.sum(concept_labels >= 0))
-        if labeled_trajectory_count == 0:
-            return
-
-    pixel_mask = build_grouped_pixel_masks(
-        trajectories=trajectories,
-        coords=coords,
-        height=height,
-        width=width,
-        temporal_mode="absolute",
-        start_frames=kept_start_frames,
-        total_frames=num_flow_frames,
-        labels=concept_labels,
-        num_groups=args.num_concepts if concept_labels is not None else None,
-        preserve_label_ids=concept_labels is not None,
-    )
-    if concept_labels is None:
-        pixel_mask = pixel_mask[0]
-
-    save_dir = args.output_root / sample_id
-    save_dir.mkdir(parents=True, exist_ok=True)
-    np.save(save_dir / "pixel_mask.npy", pixel_mask.astype(np.uint8))
-    metadata = {
-        "sample_id": sample_id,
-        "num_flow_frames": int(num_flow_frames),
-        "trajectory_length": int(trajectory_stacks.shape[1]),
-        "trajectory_stride": int(args.trajectory_stride) if args.flow_root is not None else None,
-        "trajectory_start_mode": args.trajectory_start_mode,
-        "pixel_height": int(height),
-        "pixel_width": int(width),
-        "num_surviving_trajectories": int(len(trajectories)),
-        "coverage": _compute_coverage_stats(pixel_mask),
-        "preprocessing": extra_info,
-    }
-    if concept_labels is not None:
-        metadata["num_concepts"] = int(args.num_concepts)
-        metadata["num_labeled_trajectories"] = int(labeled_trajectory_count)
-        metadata["concept_map_path"] = str(args.concept_map_path)
-    with open(save_dir / "metadata.json", "w", encoding="utf-8") as f:
-        json.dump(metadata, f, indent=2)
-
-
 def process_global_sample(sample_id: str, sample_payload: dict[str, np.ndarray], args: argparse.Namespace) -> None:
     (
         trajectories,
@@ -489,6 +486,25 @@ def process_global_sample(sample_id: str, sample_payload: dict[str, np.ndarray],
         preserve_label_ids=True,
     )
 
+    raw_shape = pixel_mask.shape
+    video_meta = args._video_metadata.get(sample_id) if args._video_metadata else None
+
+    if video_meta is not None and args.patch_size is not None and args.tubelet_size is not None:
+        total_video_frames, video_h, video_w = video_meta
+        pixel_mask = _downsample_mask_like_training(
+            pixel_mask,
+            total_video_frames=total_video_frames,
+            video_h=video_h,
+            video_w=video_w,
+            data_set=args.data_set,
+            num_frames=args.num_frames,
+            sampling_rate=args.sampling_rate,
+            short_side_size=args.short_side_size,
+            input_size=args.input_size,
+            patch_size=args.patch_size,
+            tubelet_size=args.tubelet_size,
+        )
+
     save_dir = args.output_root / sample_id
     save_dir.mkdir(parents=True, exist_ok=True)
     np.save(save_dir / "pixel_mask.npy", pixel_mask.astype(np.uint8))
@@ -496,8 +512,6 @@ def process_global_sample(sample_id: str, sample_payload: dict[str, np.ndarray],
         "sample_id": sample_id,
         "num_flow_frames": int(num_flow_frames),
         "trajectory_length": int(trajectory_length),
-        "trajectory_stride": None,
-        "trajectory_start_mode": args.trajectory_start_mode,
         "pixel_height": int(height),
         "pixel_width": int(width),
         "num_surviving_trajectories": int(len(trajectories)),
@@ -506,6 +520,12 @@ def process_global_sample(sample_id: str, sample_payload: dict[str, np.ndarray],
         "coverage": _compute_coverage_stats(pixel_mask),
         "preprocessing": extra_info,
         "seed_hint": int(seed_value),
+        "downsampling": {
+            "patch_size": args.patch_size,
+            "tubelet_size": args.tubelet_size,
+            "raw_shape": list(int(d) for d in raw_shape),
+            "stored_shape": list(int(d) for d in pixel_mask.shape),
+        },
     }
     with open(save_dir / "metadata.json", "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
@@ -514,11 +534,6 @@ def process_global_sample(sample_id: str, sample_payload: dict[str, np.ndarray],
 def _process_global_sample_task(task: tuple[str, dict[str, np.ndarray], argparse.Namespace]) -> None:
     sample_id, sample_payload, args = task
     process_global_sample(sample_id, sample_payload, args)
-
-
-def _process_flow_file_task(task: tuple[Path, argparse.Namespace]) -> None:
-    flow_path, args = task
-    process_flow_file(flow_path, args)
 
 
 def _run_tasks_in_parallel(
@@ -543,57 +558,54 @@ def main() -> None:
     args = parse_args()
     if args.num_workers < 1:
         raise ValueError("--num-workers must be >= 1")
-    args.concept_map = None
-    args.num_concepts = 0
-    args.global_result = None
-    _ensure_runtime_caches(args)
-    if args.global_result_dir is not None:
-        args.global_result = load_global_result(args.global_result_dir)
-        args.num_concepts = int(args.global_result["num_concepts"])
-        sample_ids = sorted(args.global_result["by_sample"].keys())
-        if args.limit is not None:
-            sample_ids = sample_ids[: args.limit]
-        print(
-            f"Loaded global result with {len(args.global_result['by_sample'])} samples "
-            f"across {args.num_concepts} concepts from {args.global_result_dir}",
-            flush=True,
-        )
-        print(
-            f"Building pseudo labels for {len(sample_ids)} samples from global result "
-            f"with {args.num_workers} worker(s).",
-            flush=True,
-        )
-        tasks = [(sample_id, args.global_result["by_sample"][sample_id], args) for sample_id in sample_ids]
-        _run_tasks_in_parallel(
-            tasks=tasks,
-            task_fn=_process_global_sample_task,
-            num_workers=args.num_workers,
-            desc="Building pseudo labels",
-            unit="sample",
-        )
-        print(f"Finished building pseudo labels for {len(sample_ids)} samples.", flush=True)
-        return
-    elif args.concept_map_path is not None:
-        args.concept_map, args.num_concepts = load_concept_map(args.concept_map_path)
-        print(
-            f"Loaded concept map with {len(args.concept_map)} trajectory assignments "
-            f"across {args.num_concepts} concepts from {args.concept_map_path}",
-            flush=True,
-        )
-    root = args.flow_root if args.flow_root is not None else args.trajectory_root
-    flow_paths = sorted(root.rglob("*.npy"))
+
+    args._num_flow_frames_cache = {}
+    args._raw_flow_path_cache = {}
+
+    global_result = load_global_result(args.global_result_dir)
+    args.num_concepts = int(global_result["num_concepts"])
+    sample_ids = sorted(global_result["by_sample"].keys())
     if args.limit is not None:
-        flow_paths = flow_paths[: args.limit]
-    print(f"Found {len(flow_paths)} input files under {root}; using {args.num_workers} worker(s).", flush=True)
-    tasks = [(flow_path, args) for flow_path in flow_paths]
+        sample_ids = sample_ids[: args.limit]
+
+    # Pre-compute video metadata when downsampling is requested
+    downsample_requested = args.patch_size is not None or args.tubelet_size is not None
+    if downsample_requested:
+        if args.anno_path is None or args.data_root is None or args.data_set is None:
+            raise ValueError(
+                "--anno-path, --data-root, and --data-set are required "
+                "when --patch-size or --tubelet-size is specified."
+            )
+        anno_samples = _load_annotation_samples(args.anno_path)
+        args._video_metadata = _precompute_video_metadata(sample_ids, anno_samples, args.data_root)
+        print(
+            f"Video metadata loaded for {len(args._video_metadata)} / {len(sample_ids)} samples. "
+            f"Downsampling: patch_size={args.patch_size}, tubelet_size={args.tubelet_size}.",
+            flush=True,
+        )
+    else:
+        args._video_metadata = {}
+
+    print(
+        f"Loaded global result with {len(global_result['by_sample'])} samples "
+        f"across {args.num_concepts} concepts from {args.global_result_dir}",
+        flush=True,
+    )
+    print(
+        f"Building pseudo labels for {len(sample_ids)} samples "
+        f"with {args.num_workers} worker(s).",
+        flush=True,
+    )
+
+    tasks = [(sample_id, global_result["by_sample"][sample_id], args) for sample_id in sample_ids]
     _run_tasks_in_parallel(
         tasks=tasks,
-        task_fn=_process_flow_file_task,
+        task_fn=_process_global_sample_task,
         num_workers=args.num_workers,
         desc="Building pseudo labels",
         unit="sample",
     )
-    print(f"Finished building pseudo labels for {len(flow_paths)} files.", flush=True)
+    print(f"Finished building pseudo labels for {len(sample_ids)} samples.", flush=True)
 
 
 if __name__ == "__main__":

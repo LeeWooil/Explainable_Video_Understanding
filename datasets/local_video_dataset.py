@@ -16,6 +16,7 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 
 from utils import video_transforms as videomae_video_transforms
+from utils import volume_transforms
 from utils.pseudo_labels import build_target_from_meta
 
 
@@ -49,6 +50,27 @@ def _apply_crop_and_resize(images: torch.Tensor, crop_params: tuple[int, int, in
         mode="bilinear",
         align_corners=False,
     )
+
+
+def _compute_resize_and_center_crop_params(
+    height: int,
+    width: int,
+    short_side_size: int,
+    input_size: int,
+) -> tuple[int, int, int, int]:
+    if (width <= height and width == short_side_size) or (height <= width and height == short_side_size):
+        new_h, new_w = height, width
+    elif width < height:
+        new_w = short_side_size
+        new_h = int(short_side_size * height / width)
+    else:
+        new_h = short_side_size
+        new_w = int(short_side_size * width / height)
+
+    crop_h = crop_w = input_size
+    top = int(round((new_h - crop_h) / 2.0))
+    left = int(round((new_w - crop_w) / 2.0))
+    return top, left, crop_h, crop_w
 
 
 class LocalVideoDataset(Dataset):
@@ -86,6 +108,17 @@ class LocalVideoDataset(Dataset):
             input_size=(self.input_size, self.input_size),
             auto_augment="rand-m7-n4-mstd0.5-inc1",
             interpolation="bicubic",
+        )
+        self.eval_transform = videomae_video_transforms.Compose(
+            [
+                videomae_video_transforms.Resize(self.short_side_size, interpolation="bilinear"),
+                videomae_video_transforms.CenterCrop(size=(self.input_size, self.input_size)),
+                volume_transforms.ClipToTensor(),
+                videomae_video_transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225],
+                ),
+            ]
         )
 
     def __len__(self) -> int:
@@ -145,36 +178,21 @@ class LocalVideoDataset(Dataset):
         )
 
     def _transform_frames(self, frames: np.ndarray) -> tuple[torch.Tensor, dict[str, Any]]:
-        frame_list = [Image.fromarray(frame) for frame in frames]
-        if self.view_mode == "random" and not self.deterministic:
-            frame_list = self.aug_transform(frame_list)
-        frame_tensors = [self.rgb_transform(frame) for frame in frame_list]
-        video = torch.stack(frame_tensors, dim=0)  # T,C,H,W
-
         if self.view_mode == "center_uniform" or self.deterministic:
-            # PCBEAR-compatible: Resize short side -> CenterCrop -> Normalize
-            _, _, h, w = video.shape
-            if h < w:
-                new_h = self.short_side_size
-                new_w = int(w * new_h / h)
-            else:
-                new_w = self.short_side_size
-                new_h = int(h * new_w / w)
-            video = torch.nn.functional.interpolate(
-                video, size=(new_h, new_w), mode="bilinear", align_corners=False
+            h, w = frames.shape[1], frames.shape[2]
+            video = self.eval_transform(list(frames))
+            crop_params = _compute_resize_and_center_crop_params(
+                height=h,
+                width=w,
+                short_side_size=self.short_side_size,
+                input_size=self.input_size,
             )
-            # CenterCrop to input_size
-            crop_h = crop_w = self.input_size
-            top = max((new_h - crop_h) // 2, 0)
-            left = max((new_w - crop_w) // 2, 0)
-            crop_params = (top, left, crop_h, crop_w)
-            video = video[:, :, top : top + crop_h, left : left + crop_w]
-            # Normalize
-            video = video.permute(0, 2, 3, 1)  # T,H,W,C
-            video = _tensor_normalize(video, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-            video = video.permute(3, 0, 1, 2)  # C,T,H,W
         else:
             # Training augmentation: Normalize -> RandomCrop -> Resize
+            frame_list = [Image.fromarray(frame) for frame in frames]
+            frame_list = self.aug_transform(frame_list)
+            frame_tensors = [self.rgb_transform(frame) for frame in frame_list]
+            video = torch.stack(frame_tensors, dim=0)  # T,C,H,W
             video = video.permute(0, 2, 3, 1)  # T,H,W,C
             video = _tensor_normalize(video, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
             video = video.permute(3, 0, 1, 2)  # C,T,H,W
@@ -243,20 +261,23 @@ class LocalConceptVideoDataset(LocalVideoDataset):
         digest = hashlib.sha1(json.dumps(key_payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
         return self.target_cache_root / meta["sample_id"] / f"{digest}.pt"
 
-    def _load_predownsampled_target(self, meta: dict[str, Any]) -> torch.Tensor:
-        """Load pseudo mask that is already in [C, T_feat, H_patch, W_patch] shape."""
-        from utils.pseudo_labels import load_pixel_mask
-        mask = load_pixel_mask(self.pseudo_mask_root, meta["sample_id"])
-        return torch.from_numpy(np.array(mask, copy=True)).to(dtype=torch.float32)
+    def _load_predownsampled(self, sample_id: str) -> torch.Tensor:
+        """Load a mask that was already downsampled by build_pseudo_labels.py."""
+        mask_path = self.pseudo_mask_root / sample_id / "pixel_mask.npy"
+        mask = np.load(mask_path)
+        target = torch.from_numpy(mask).float()
+        if target.ndim == 3:
+            target = target.unsqueeze(0)
+        return target
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, int, torch.Tensor, dict[str, Any]]:
         video, label, meta = super().__getitem__(index)
         if self.predownsampled:
-            target = self._load_predownsampled_target(meta)
+            target = self._load_predownsampled(meta["sample_id"])
         else:
             cache_path = self._target_cache_path(meta)
             if cache_path is not None and cache_path.exists():
-                target = torch.load(cache_path, map_location="cpu")
+                target = torch.load(cache_path, map_location="cpu", weights_only=True)
             else:
                 target = build_target_from_meta(
                     meta=meta,

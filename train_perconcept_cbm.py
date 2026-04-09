@@ -3,7 +3,6 @@
 Pipeline:
   Video -> FrozenLocalizer -> (concept_logits [B,C,T,H,W], feature_map [B,D,T,H,W])
        -> ConceptGuidedAttentionPool -> [B, C, D]  (per-concept attended features)
-       -> fc_norm (LayerNorm)
        -> W_c [C, D] per-concept projection: score[c] = W_c[c] · feat[c] -> [B, C]
        -> W_g (GLM-SAGA sparse classifier) -> [B, num_classes]
 
@@ -90,6 +89,10 @@ def parse_args() -> argparse.Namespace:
     # output
     parser.add_argument("--save-dir", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=0)
+    # cached features
+    parser.add_argument("--cached-features-dir", type=Path, default=None,
+                        help="Path to pre-extracted localizer features from extract_localizer_features.py. "
+                             "If provided, skips model construction and inference.")
     parser.set_defaults(use_checkpoint=False, use_mean_pooling=True)
     return parser.parse_args()
 
@@ -187,7 +190,6 @@ def extract_perconcept_features(
     loader: DataLoader,
     model: VideoMAELocalizer,
     pool: ConceptGuidedAttentionPool,
-    fc_norm: nn.Module,
     device: torch.device,
     desc: str,
     temperature: float = 5.0,
@@ -214,12 +216,7 @@ def extract_perconcept_features(
 
             # Per-concept attention pooling -> [B, C, D]
             pooled = pool(feature_map, concept_logits)
-
-            # Apply LayerNorm per concept (over D dimension)
             B, C, D = pooled.shape
-            pooled_flat = pooled.view(B * C, D)
-            pooled_flat = fc_norm(pooled_flat)
-            pooled = pooled_flat.view(B, C, D)
 
             pooled_batches.append(pooled.cpu())
             label_batches.append(labels.cpu())
@@ -460,56 +457,82 @@ def main() -> None:
             indent=2,
         )
 
-    # -- Data loaders --
-    train_loader, train_labels = make_loader(args.anno_path, args.data_root, args)
-    val_loader, val_labels = make_loader(
-        args.val_anno_path, args.val_data_root or args.data_root, args
-    )
-
-    # -- Load frozen localizer (backbone + concept head) --
-    model_args = build_videomae_args(args)
-    backbone = FrozenVideoMAEBackbone.from_args(model_args, device=device)
-    model = VideoMAELocalizer(backbone, out_channels=args.num_concepts).to(device)
-    checkpoint = torch.load(args.localizer_ckpt, map_location="cpu", weights_only=True)
-    model.load_state_dict(checkpoint["model"], strict=True)
-    model.eval()
-    for param in model.parameters():
-        param.requires_grad = False
-
     pool = ConceptGuidedAttentionPool(temperature=args.attention_temperature)
 
-    # -- Extract fc_norm from the backbone (LayerNorm applied after pooling) --
-    vmae_model = model.backbone.model
-    fc_norm = vmae_model.fc_norm if vmae_model.fc_norm is not None else nn.Identity()
-    fc_norm = fc_norm.to(device)
-    fc_norm.eval()
-    print(f"fc_norm: {fc_norm}")
+    if args.cached_features_dir is not None:
+        # -- Load pre-extracted localizer outputs --
+        cache_dir = args.cached_features_dir
+        print(f"Loading cached features from {cache_dir}")
 
-    # -- Extract per-concept attended features [N, C, D] --
-    print("Extracting per-concept attended features...")
-    train_features, train_y, train_sample_ids = extract_perconcept_features(
-        loader=train_loader,
-        model=model,
-        pool=pool,
-        fc_norm=fc_norm,
-        device=device,
-        desc="extract-train",
-        temperature=args.attention_temperature,
-    )
-    val_features, val_y, val_sample_ids = extract_perconcept_features(
-        loader=val_loader,
-        model=model,
-        pool=pool,
-        fc_norm=fc_norm,
-        device=device,
-        desc="extract-val",
-        temperature=args.attention_temperature,
-    )
+        train_sample_ids = json.load(open(cache_dir / "train_sample_ids.json"))
+        val_sample_ids = json.load(open(cache_dir / "val_sample_ids.json"))
+        train_y = torch.load(cache_dir / "train_labels.pt", map_location="cpu", weights_only=True)
+        val_y = torch.load(cache_dir / "val_labels.pt", map_location="cpu", weights_only=True)
 
-    if train_labels != train_y.tolist():
-        raise ValueError("Train label order mismatch.")
-    if val_labels != val_y.tolist():
-        raise ValueError("Val label order mismatch.")
+        # Apply per-concept attention pooling in batches
+        train_clogits = torch.load(cache_dir / "train_concept_logits.pt", map_location="cpu", weights_only=True)
+        train_fmap = torch.load(cache_dir / "train_feature_map.pt", map_location="cpu", weights_only=True)
+        print(f"[train] concept_logits: {tuple(train_clogits.shape)}, feature_map: {tuple(train_fmap.shape)}")
+
+        train_pooled = []
+        for i in range(0, len(train_fmap), args.batch_size):
+            chunk_fmap = train_fmap[i:i + args.batch_size].to(device)
+            chunk_clog = train_clogits[i:i + args.batch_size].to(device)
+            train_pooled.append(pool(chunk_fmap, chunk_clog).cpu())
+        train_features = torch.cat(train_pooled, dim=0)
+        del train_clogits, train_fmap, train_pooled
+
+        val_clogits = torch.load(cache_dir / "val_concept_logits.pt", map_location="cpu", weights_only=True)
+        val_fmap = torch.load(cache_dir / "val_feature_map.pt", map_location="cpu", weights_only=True)
+        print(f"[val] concept_logits: {tuple(val_clogits.shape)}, feature_map: {tuple(val_fmap.shape)}")
+
+        val_pooled = []
+        for i in range(0, len(val_fmap), args.batch_size):
+            chunk_fmap = val_fmap[i:i + args.batch_size].to(device)
+            chunk_clog = val_clogits[i:i + args.batch_size].to(device)
+            val_pooled.append(pool(chunk_fmap, chunk_clog).cpu())
+        val_features = torch.cat(val_pooled, dim=0)
+        del val_clogits, val_fmap, val_pooled
+        torch.cuda.empty_cache()
+
+    else:
+        # -- Original path: build model and run inference --
+        train_loader, train_labels = make_loader(args.anno_path, args.data_root, args)
+        val_loader, val_labels = make_loader(
+            args.val_anno_path, args.val_data_root or args.data_root, args
+        )
+
+        model_args = build_videomae_args(args)
+        backbone = FrozenVideoMAEBackbone.from_args(model_args, device=device)
+        model = VideoMAELocalizer(backbone, out_channels=args.num_concepts).to(device)
+        checkpoint = torch.load(args.localizer_ckpt, map_location="cpu", weights_only=True)
+        model.load_state_dict(checkpoint["model"], strict=True)
+        model.eval()
+        for param in model.parameters():
+            param.requires_grad = False
+
+        print("Extracting per-concept attended features...")
+        train_features, train_y, train_sample_ids = extract_perconcept_features(
+            loader=train_loader,
+            model=model,
+            pool=pool,
+            device=device,
+            desc="extract-train",
+            temperature=args.attention_temperature,
+        )
+        val_features, val_y, val_sample_ids = extract_perconcept_features(
+            loader=val_loader,
+            model=model,
+            pool=pool,
+            device=device,
+            desc="extract-val",
+            temperature=args.attention_temperature,
+        )
+
+        if train_labels != train_y.tolist():
+            raise ValueError("Train label order mismatch.")
+        if val_labels != val_y.tolist():
+            raise ValueError("Val label order mismatch.")
 
     print(f"Train features: {tuple(train_features.shape)}")  # [N, C, D]
     print(f"Val features:   {tuple(val_features.shape)}")
