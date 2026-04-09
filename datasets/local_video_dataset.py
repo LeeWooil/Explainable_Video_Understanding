@@ -145,39 +145,36 @@ class LocalVideoDataset(Dataset):
         )
 
     def _transform_frames(self, frames: np.ndarray) -> tuple[torch.Tensor, dict[str, Any]]:
+        frame_list = [Image.fromarray(frame) for frame in frames]
+        if self.view_mode == "random" and not self.deterministic:
+            frame_list = self.aug_transform(frame_list)
+        frame_tensors = [self.rgb_transform(frame) for frame in frame_list]
+        video = torch.stack(frame_tensors, dim=0)  # T,C,H,W
+
         if self.view_mode == "center_uniform" or self.deterministic:
-            # PCBEAR-compatible: cv2 resize on uint8 numpy -> CenterCrop -> ToTensor -> Normalize
-            import cv2
-            h, w = frames.shape[1], frames.shape[2]
-            if (w <= h and w == self.short_side_size) or (h <= w and h == self.short_side_size):
-                new_h, new_w = h, w
-            elif w < h:
-                new_w = self.short_side_size
-                new_h = int(self.short_side_size * h / w)
-            else:
+            # PCBEAR-compatible: Resize short side -> CenterCrop -> Normalize
+            _, _, h, w = video.shape
+            if h < w:
                 new_h = self.short_side_size
-                new_w = int(self.short_side_size * w / h)
-            # Resize each frame using cv2 (matches PCBEAR's video_transforms.Resize)
-            resized = np.stack([
-                cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-                for frame in frames
-            ])  # [T, new_h, new_w, C] uint8
-            # CenterCrop
+                new_w = int(w * new_h / h)
+            else:
+                new_w = self.short_side_size
+                new_h = int(h * new_w / w)
+            video = torch.nn.functional.interpolate(
+                video, size=(new_h, new_w), mode="bilinear", align_corners=False
+            )
+            # CenterCrop to input_size
             crop_h = crop_w = self.input_size
             top = max((new_h - crop_h) // 2, 0)
             left = max((new_w - crop_w) // 2, 0)
             crop_params = (top, left, crop_h, crop_w)
-            cropped = resized[:, top : top + crop_h, left : left + crop_w, :]
-            # ToTensor (uint8 0-255 -> float32 0-1) + Normalize
-            video = torch.from_numpy(cropped).float() / 255.0  # [T, H, W, C]
+            video = video[:, :, top : top + crop_h, left : left + crop_w]
+            # Normalize
+            video = video.permute(0, 2, 3, 1)  # T,H,W,C
             video = _tensor_normalize(video, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
             video = video.permute(3, 0, 1, 2)  # C,T,H,W
         else:
             # Training augmentation: Normalize -> RandomCrop -> Resize
-            frame_list = [Image.fromarray(frame) for frame in frames]
-            frame_list = self.aug_transform(frame_list)
-            frame_tensors = [self.rgb_transform(frame) for frame in frame_list]
-            video = torch.stack(frame_tensors, dim=0)  # T,C,H,W
             video = video.permute(0, 2, 3, 1)  # T,H,W,C
             video = _tensor_normalize(video, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
             video = video.permute(3, 0, 1, 2)  # C,T,H,W
@@ -214,6 +211,7 @@ class LocalConceptVideoDataset(LocalVideoDataset):
         input_size: int = 224,
         deterministic: bool = True,
         view_mode: str = "random",
+        predownsampled: bool = False,
     ) -> None:
         super().__init__(
             anno_path=anno_path,
@@ -229,6 +227,7 @@ class LocalConceptVideoDataset(LocalVideoDataset):
         self.tubelet_size = int(tubelet_size)
         self.patch_size = int(patch_size)
         self.target_cache_root = Path(target_cache_root) if target_cache_root is not None else None
+        self.predownsampled = bool(predownsampled)
 
     def _target_cache_path(self, meta: dict[str, Any]) -> Path | None:
         if self.target_cache_root is None:
@@ -244,21 +243,30 @@ class LocalConceptVideoDataset(LocalVideoDataset):
         digest = hashlib.sha1(json.dumps(key_payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
         return self.target_cache_root / meta["sample_id"] / f"{digest}.pt"
 
+    def _load_predownsampled_target(self, meta: dict[str, Any]) -> torch.Tensor:
+        """Load pseudo mask that is already in [C, T_feat, H_patch, W_patch] shape."""
+        from utils.pseudo_labels import load_pixel_mask
+        mask = load_pixel_mask(self.pseudo_mask_root, meta["sample_id"])
+        return torch.from_numpy(np.array(mask, copy=True)).to(dtype=torch.float32)
+
     def __getitem__(self, index: int) -> tuple[torch.Tensor, int, torch.Tensor, dict[str, Any]]:
         video, label, meta = super().__getitem__(index)
-        cache_path = self._target_cache_path(meta)
-        if cache_path is not None and cache_path.exists():
-            target = torch.load(cache_path, map_location="cpu", weights_only=True)
+        if self.predownsampled:
+            target = self._load_predownsampled_target(meta)
         else:
-            target = build_target_from_meta(
-                meta=meta,
-                mask_root=self.pseudo_mask_root,
-                tubelet_size=self.tubelet_size,
-                input_size=self.input_size,
-                patch_size=self.patch_size,
-            )
-            if cache_path is not None:
-                cache_path.parent.mkdir(parents=True, exist_ok=True)
-                torch.save(target.contiguous().to(dtype=torch.uint8), cache_path)
+            cache_path = self._target_cache_path(meta)
+            if cache_path is not None and cache_path.exists():
+                target = torch.load(cache_path, map_location="cpu")
+            else:
+                target = build_target_from_meta(
+                    meta=meta,
+                    mask_root=self.pseudo_mask_root,
+                    tubelet_size=self.tubelet_size,
+                    input_size=self.input_size,
+                    patch_size=self.patch_size,
+                )
+                if cache_path is not None:
+                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    torch.save(target.contiguous().to(dtype=torch.uint8), cache_path)
         target = target.to(dtype=torch.float32)
         return video, label, target, meta

@@ -72,6 +72,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--block-index", type=int, default=6)
+    parser.add_argument("--head-type", type=str, default="conv1x1x1",
+                        choices=["conv1x1x1", "conv3x1x1", "conv3x3x3", "cross_attn"],
+                        help="Concept head type: conv1x1x1 (baseline), conv3x1x1 (temporal), conv3x3x3 (spatio-temporal), cross_attn")
+    parser.add_argument("--head-num-heads", type=int, default=4,
+                        help="Number of attention heads (only for cross_attn)")
+    parser.add_argument("--head-dropout", type=float, default=0.0,
+                        help="Dropout rate in concept head (only for cross_attn)")
     parser.add_argument("--num-frames", type=int, default=16)
     parser.add_argument("--num-segments", type=int, default=1)
     parser.add_argument("--sampling-rate", type=int, default=4)
@@ -98,6 +105,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-cache-root", type=Path, default=None)
     parser.add_argument("--precompute-target-cache", action="store_true")
     parser.add_argument("--precompute-target-cache-only", action="store_true")
+    parser.add_argument("--predownsampled", action="store_true",
+                        help="Pseudo masks are already downsampled to [C,T',H',W'] by build_pseudo_labels.py. "
+                             "Skip frame selection, crop, resize, and pooling at load time.")
     parser.add_argument("--use-pos-weight", action="store_true")
     parser.add_argument("--pos-weight-max", type=float, default=10.0)
     parser.add_argument("--pos-weight-eps", type=float, default=1e-6)
@@ -135,6 +145,7 @@ def _build_dataset(
         input_size=cli_args.input_size,
         deterministic=cli_args.deterministic_spatial,
         view_mode=cli_args.view_mode,
+        predownsampled=cli_args.predownsampled,
     )
 
 
@@ -144,23 +155,15 @@ def _precompute_target_cache(
     cli_args: argparse.Namespace,
 ) -> None:
     dataset = _build_dataset(anno_path=anno_path, data_root=data_root, cli_args=cli_args)
-    if _is_distributed():
-        sampler = DistributedSampler(dataset, shuffle=False)
-    else:
-        sampler = None
     loader = DataLoader(
         dataset,
         batch_size=1,
         shuffle=False,
-        sampler=sampler,
         num_workers=cli_args.num_workers,
         pin_memory=False,
         collate_fn=_collate_batch,
     )
-    rank = int(os.environ.get("RANK", 0))
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-    desc = f"target-cache-{anno_path.stem} [rank {rank}/{world_size}]"
-    progress = tqdm(loader, desc=desc, dynamic_ncols=True)
+    progress = tqdm(loader, desc=f"target-cache-{anno_path.stem}", dynamic_ncols=True, disable=not _is_main_process())
     for _inputs, _labels, _targets, _metas in progress:
         pass
 
@@ -371,6 +374,7 @@ def _save_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, epoch: 
             "model": _unwrap_model(model).state_dict(),
             "optimizer": optimizer.state_dict(),
             "metrics": metrics,
+            "head_type": _unwrap_model(model).head_type,
         },
         output_dir / name,
     )
@@ -388,7 +392,7 @@ def _infer_num_concepts(mask_root: Path, anno_path: Path) -> int:
         mask_path = mask_root / sample_id / "pixel_mask.npy"
         if not mask_path.exists():
             continue
-        mask = np.load(mask_path, mmap_mode="r")
+        mask = torch.from_numpy(np.load(mask_path))
         if mask.ndim == 3:
             return 1
         if mask.ndim == 4:
@@ -425,18 +429,18 @@ def main() -> None:
                 raise ValueError("--precompute-target-cache requires --target-cache-root.")
             if cli_args.view_mode != "center_uniform":
                 raise ValueError("--precompute-target-cache is only supported with --view-mode center_uniform.")
-            # All ranks participate in cache building (each processes its own shard)
-            _precompute_target_cache(
-                anno_path=cli_args.anno_path,
-                data_root=cli_args.data_root,
-                cli_args=cli_args,
-            )
-            if cli_args.val_anno_path is not None:
+            if _is_main_process():
                 _precompute_target_cache(
-                    anno_path=cli_args.val_anno_path,
-                    data_root=cli_args.val_data_root or cli_args.data_root,
+                    anno_path=cli_args.anno_path,
+                    data_root=cli_args.data_root,
                     cli_args=cli_args,
                 )
+                if cli_args.val_anno_path is not None:
+                    _precompute_target_cache(
+                        anno_path=cli_args.val_anno_path,
+                        data_root=cli_args.val_data_root or cli_args.data_root,
+                        cli_args=cli_args,
+                    )
             if _is_distributed():
                 dist.barrier()
             if cli_args.precompute_target_cache_only:
@@ -459,7 +463,13 @@ def main() -> None:
                 shuffle=False,
             )
 
-        model = VideoMAELocalizer(backbone, out_channels=cli_args.num_concepts).to(device)
+        model = VideoMAELocalizer(
+            backbone,
+            out_channels=cli_args.num_concepts,
+            head_type=cli_args.head_type,
+            num_heads=cli_args.head_num_heads,
+            head_dropout=cli_args.head_dropout,
+        ).to(device)
         if _is_distributed():
             model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
         pos_weight = _resolve_pos_weight(cli_args, device)

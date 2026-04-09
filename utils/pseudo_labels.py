@@ -151,6 +151,21 @@ def build_target_from_meta(
     sample_id = meta["sample_id"]
     frame_indices = meta["frame_indices"]
     crop_params = tuple(meta["crop_params"])
+
+    # Check if mask is already in final patch-level shape [C, T_feat, H_patch, W_patch]
+    # e.g., (154, 8, 14, 14) — already processed, skip crop/resize/pool pipeline
+    expected_t = len(frame_indices) // tubelet_size
+    expected_hw = input_size // patch_size  # e.g., 224 // 16 = 14
+    raw_mask = load_pixel_mask(mask_root, sample_id)
+    if (
+        raw_mask.ndim == 4
+        and raw_mask.shape[1] == expected_t
+        and raw_mask.shape[2] == expected_hw
+        and raw_mask.shape[3] == expected_hw
+    ):
+        # Mask is already [C, T_feat, H_patch, W_patch], use as-is
+        return torch.from_numpy(np.array(raw_mask, copy=True)).to(dtype=torch.float32)
+
     selected = load_selected_pixel_mask(
         mask_root=mask_root,
         sample_id=sample_id,
