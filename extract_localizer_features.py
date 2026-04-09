@@ -66,6 +66,9 @@ parser.add_argument("--model-key", dest="model_key", type=str, default="model|mo
 parser.add_argument("--model-prefix", dest="model_prefix", type=str, default="")
 parser.add_argument("--deterministic-spatial", dest="deterministic_spatial", action="store_true")
 parser.add_argument("--localizer-ckpt", type=Path, required=True)
+parser.add_argument("--head-type", type=str, default=None,
+                    help="Localizer head type. Auto-detected from checkpoint if saved; "
+                         "pass explicitly for old checkpoints without head_type key.")
 
 # extraction
 parser.add_argument("--batch-size", type=int, default=16)
@@ -222,8 +225,9 @@ def main(args):
     # Build frozen localizer
     model_args = build_videomae_args(args)
     backbone = FrozenVideoMAEBackbone.from_args(model_args, device=device)
-    model = VideoMAELocalizer(backbone, out_channels=args.num_concepts).to(device)
     checkpoint = torch.load(args.localizer_ckpt, map_location="cpu", weights_only=True)
+    ckpt_head_type = checkpoint.get("head_type", None) or args.head_type or "conv1x1x1"
+    model = VideoMAELocalizer(backbone, out_channels=args.num_concepts, head_type=ckpt_head_type).to(device)
     model.load_state_dict(checkpoint["model"], strict=True)
     model.eval()
     for param in model.parameters():
